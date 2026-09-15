@@ -87,16 +87,31 @@
 **泛化（Table 4，平均关节误差）**：class-specific vs class-agnostic（Animal3D 训练）
 在 Cheetah 0.098 vs 0.202、Bama Pig 0.121 vs 0.173、Beagle Dog 0.166 vs 0.160。
 
-## 7. 数据集
+## 7. 数据集（含下载入口）
 
-| 数据集 | 物种 | 备注 |
-|--------|------|------|
-| MAMMAL (Nature Comm. 2023) | 巴马猪、比格犬 | 多实例，与猪场场景最相关 |
-| Animal3D | 40 种四足 | 训练 class-agnostic 模型 |
-| AcinoSet | 猎豹 | 野外、单实例 |
-| 3D-PoP | 鸽子 | 多实例、鸟类 |
-| CMU Panoptic | 人类幼儿 | 室内多视角 |
-| EgoHumans | 排球场景 | 人类 |
+| 数据集 | 物种 | 下载 | 规模 / 关节 |
+|--------|------|------|-------------|
+| MAMMAL / BamaPig3D | 巴马猪 | https://github.com/anl13/MAMMAL_datasets | 10 视角 × 1750 帧 @25fps，70 帧完整标注 3D；`pig_{i}frame{k}.txt` 为 23×3，第 18/20/22/23 行恒 0 → **19 个有效关节**；精简版 `BamaPig3D_pure_pickle` 481MB |
+| MAMMAL / Beagle dog | 比格犬 | https://github.com/anl13/Beagle_dog_dataset | 10 视角，113 帧带 3D 标注，29 关节 |
+| Animal3D | 40 种四足哺乳动物 | https://xujiacong.github.io/Animal3D | 3379 图、26 关节 + **SMAL 姿态/形状参数**（需 SMAL 模型转成关节坐标） |
+| AcinoSet | 猎豹 | https://github.com/African-Robotics-Unit/AcinoSet | 6 相机、119,490 帧、7,588 帧标注、含 3D GT 与标定 |
+| 3D-PoP | 鸽子 | https://github.com/alexhang212/Dataset-3DPOP （数据：https://tinyurl.com/4ckbjcpx ） | 4 相机 4K、~30 万帧、1/2/5/10 只、2D+3D 关键点 |
+| CMU Panoptic | 人类 | http://domedb.perception.cs.cmu.edu/ （需注册，用 `getData.sh`） | 多视角；幼儿序列 `160906_ian1` |
+| EgoHumans | 人类（排球） | https://github.com/rawalkhirodkar/egohumans | 多视角 |
+
+**论文实际用的序列与帧区间（附录 Table 7）**：
+
+| 目标 | 训练 | 标定（合成） | 标定（真实 2D 估计器） |
+|------|------|--------------|------------------------|
+| Cheetah | Jules flick1 (20190309) | Romeo flick (20190227) | Romeo flick (HRNet?) |
+| Bama Pig | 帧 0–1400 | 帧 1400–1750 | 帧 0–1750（HRNet） |
+| Beagle Dog | 帧 0–80 | 帧 80–112 | 帧 0–112（SuperAnimal） |
+| Pigeon | Sequence8_n01_01072022 | Sequence5_n05_01072022 | Sequence5_n05_01072022 |
+| Toddler | 171204_pose1–6 | 170915_toddler5 | 170915_toddler5（RTMO） |
+| Volleyball | 171204_pose1–6 | 001_volleyball | 001_volleyball（RTMO） |
+
+2D 姿态估计器：每类动物用其专用模型（猪 HRNet、狗 SuperAnimal、人类 RTMO 等）。
+
 
 ## 8. 本复现与论文的差异（已知）
 
