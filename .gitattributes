@@ -1,0 +1,8 @@
+# 统一使用 LF 换行（目标运行环境是 Linux 服务器）
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yaml text eol=lf

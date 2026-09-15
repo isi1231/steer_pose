@@ -1,0 +1,27 @@
+# SteerPose 复现 —— Python 依赖
+#
+# 适用环境: Ubuntu 20.04/22.04 + NVIDIA H100 (sm_90) + CUDA 12.x 驱动
+# Python: 3.10 ~ 3.12
+#
+# 安装顺序（务必先装 PyTorch 的 CUDA 版，再装其余包）:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# 国内服务器（清华镜像）:
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#   # PyTorch 的 cu124 wheel 走清华 pytorch-wheels 镜像:
+#   pip install torch --index-url https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cu124
+#
+# 说明: H100 需要 PyTorch >= 2.1（sm_90 支持），推荐 2.4~2.6 的 cu124 版本。
+#       本模型极小（约 100K 参数），单卡 H100 跑训练属于严重过剩，
+#       主要收益在于能一次性把 num_pairs 和 batch 开大、快速扫超参。
+
+# --- 运行时依赖 ---
+torch>=2.4.0,<2.7.0        # CUDA 版请用上面的 --index-url 安装，勿用默认源
+numpy>=1.24,<2.2
+scipy>=1.10                # scipy.spatial.transform.Rotation（Rodrigues 转换）
+
+# --- 可选（可视化 / 训练监控，代码未强制依赖）---
+# matplotlib>=3.7          # 画 2D 姿态、损失曲线、标定结果对比
+# tensorboard>=2.14        # 如需 tensorboard 记录（当前实现用文本日志，无需即可）
+# tqdm>=4.65               # 进度条（当前实现用 log-every 打印，无需即可）

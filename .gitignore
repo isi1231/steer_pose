@@ -1,0 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# --- 训练产物 ---
+ckpt/
+out/
+logs/
+*.pt
+*.pth
+*_train.log
+*_config.json
+
+# --- 数据（大文件不入库）---
+data/
+*.npz
+*.npy
+*.mat
+!demo/*.npz
+
+# --- 编辑器/系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
