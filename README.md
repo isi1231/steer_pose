@@ -32,9 +32,16 @@ steer_pose/
 │   ├── train.py        训练入口（CUDA/AMP/DataLoader/日志/断点）
 │   └── calibrate.py    两视角标定+匹配的推理时优化（含最多 5 次随机重启、平移求解）
 ├── scripts/
-│   ├── setup_env.sh    服务器一键配环境（conda/venv、镜像、CUDA 验证）
-│   └── prepare_data.py 把任意 3D 姿态数据整理成 poses.npz
-├── docs/paper_notes.md 论文关键细节 + 与本复现的差异说明
+│   ├── setup_env.sh      服务器一键配环境（conda/venv、镜像、CUDA 验证）
+│   ├── run_h100.sh       H100 推荐配置一键训练（quick / full / agnostic 三档）
+│   ├── sweep_h100.sh     小规模超参扫描（模型小，扫描比调参划算）
+│   ├── make_mock_mammal.py  生成"官方格式"的假数据，没下载数据集也能跑通全链路
+│   ├── prepare_data.py   任意 3D 姿态 -> poses.npz（通用）
+│   ├── prepare_mammal.py BamaPig3D 3D 标注 -> poses.npz（支持 txt 目录与 pure_pickle）
+│   └── prepare_mammal_2d.py  BamaPig3D 2D 标注 + 真值外参 -> 两视角标定输入
+├── docs/
+│   ├── paper_notes.md    论文关键细节、超参、结果、数据集、与官方实现的差异
+│   └── h100_tuning.md    ⭐️ H100 参数调整文档（每个参数为什么这么调 + 排障表）
 └── requirements.txt
 ```
 
@@ -109,21 +116,47 @@ python scripts/prepare_data.py --input raw/animal3d.npz --key joints3d \
     --joints 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 --out data/poses_animal3d.npz
 ```
 
-**MAMMAL 专用转换**（BamaPig3D 的 `label_3d/pig_{i}frame{k}.txt` 是 23×3 矩阵，
-其中第 18/20/22/23 行恒为 0 → 实际 19 个有效关节）：
+**MAMMAL 专用转换**（BamaPig3D 的 `label_3d/pig_{i}_frame_{k:06d}.txt` 是 23×3 矩阵，
+第 18/20/22/23 行恒为 0 → 官方有效索引 `[0..16, 18, 20]`，即 **19 个有效关节**；
+遮挡未标注的关节以 0 填充）：
 
 ```bash
-python scripts/prepare_mammal.py --src /data/BamaPig3D/label_3d --dry-run   # 先看匹配情况
-python scripts/prepare_mammal.py --src /data/BamaPig3D/label_3d \
-    --out data/poses_bamapig.npz --min-valid-joints 12
+# A. 原始 txt 目录（推荐用 label_mix，它用 label_mesh 补齐了缺失关节）
+python scripts/prepare_mammal.py --src /data/BamaPig3D/label_mix --dry-run
+python scripts/prepare_mammal.py --src /data/BamaPig3D/label_mix \
+    --max-frame 1400 --out data/poses_bamapig_train.npz     # 论文训练划分：帧 <= 1400
+
+# B. 精简版 pkl（481MB，最省事）
+python scripts/prepare_mammal.py --src /data/BamaPig3D_pure_pickle/label_mix.pkl \
+    --max-frame 1400 --out data/poses_bamapig_train.npz
 ```
-（该脚本按官方数据说明编写，**尚未在真实数据上验证**，请先用 `--dry-run` 核对。）
+
+**两视角标定实验的数据准备**（用官方 2D 标注 + 真值外参，直接能算旋转误差）：
+
+```bash
+python scripts/prepare_mammal_2d.py \
+    --kp2d /data/BamaPig3D_pure_pickle/label_keypoints2d.pkl \
+    --extrinsics /data/BamaPig3D/extrinsic_camera_params \
+    --cam-a 0 --cam-b 6 --min-frame 1400 \           # 论文标定划分：帧 1400-1750
+    --out data/two_view_pig_c0_c6.npz
+```
+输出 `P / P2 / R(真值) / t(真值)`，配合 `steerpose.calibrate` 即可算出论文的 ER/Et。
+加 `--noise-px 3` 可模拟论文"GT 2D + 高斯噪声 σ=3px"的设置。
+
+**没有数据集也能先跑通全链路**（生成官方格式的假数据）：
+
+```bash
+python scripts/make_mock_mammal.py --out data/mock_bamapig
+# 之后依次跑 prepare_mammal.py / steerpose.train / prepare_mammal_2d.py / steerpose.calibrate
+```
+⚠️ 该假数据骨架为程序化生成，**只用于验证代码链路，不能用于任何精度结论**。
 
 ⚠️ **Animal3D 的坑**：它给的是 SMAL 模型的姿态/形状参数而非 3D 关节坐标，
 要用于 SteerPose 训练需先用 SMAL 模型回归出关节位置（论文也是这么做的）。
 嫌麻烦的话，用 BamaPig3D + Beagle Dog（直接就是 3D 关节）训四足模型最快。
 
 脚本会自动：展平多余维度、剔除含 NaN/Inf 的姿态、逐姿态居中、打印数据规模与坐标范围。
+
 
 
 ## 训练
@@ -137,6 +170,18 @@ python -m steerpose.train --poses3d data/poses_quadruped.npz \
 # 演示数据快速跑通
 python -m steerpose.train --demo --epochs 50 --num-pairs 2000 --out ckpt/demo.pt
 ```
+
+**H100 上直接用推荐配置（三档：quick / full / agnostic）**：
+
+```bash
+bash scripts/run_h100.sh data/poses_bamapig_train.npz quick   # 先验证链路
+bash scripts/run_h100.sh data/poses_bamapig_train.npz         # 正式训练
+bash scripts/sweep_h100.sh data/poses_bamapig_train.npz       # 超参扫描（推荐）
+```
+> ⭐️ **参数怎么调、为什么这么调、遇到问题怎么办，全部写在
+> [`docs/h100_tuning.md`](docs/h100_tuning.md)** —— 上服务器前请先读它。
+> 一句话结论：模型只有 ~69K 参数，H100 是过剩的；真正该调大的是
+> `--num-pairs`（3000 → 20000+）和 `--batch`（512 → 4096），瓶颈在 DataLoader 而不在 GPU。
 
 要点（对应论文附录 D.1/D.3）：
 
