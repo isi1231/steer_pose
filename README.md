@@ -11,6 +11,22 @@ SteerPose 的**独立复现**实现 —— 无需标定板的多相机外参标�
 > （Training Details and Implementation）独立实现的复现版本，**不是官方代码**。
 > 论文细节整理见 [`docs/paper_notes.md`](docs/paper_notes.md)；
 > 官方代码放出后建议对照校准。
+>
+> **额外**：本仓库还移植了同作者前作 **RA-L2022
+> `Extrinsic Camera Calibration From a Moving Person`** 的几何标定链路，
+> 补上 SteerPose 缺失的 **2D → 单目 3D → 外参** 这一环（面向猪等多物种/畜牧场景）。
+> 见 [`docs/ral_backend.md`](docs/ral_backend.md) 与下文
+> [「RA-L2022 改造」](#ra-l2022-改造2d--单目-3d--外参)。
+
+## 两条可选的标定路线
+
+| | SteerPose（原论文） | RA-L2022（本仓库新增） |
+|---|---|---|
+| 数据流 | **2D → 2D**（跨视角"心理旋转"匹配） | **2D → 单目 3D → 外参** |
+| 核心观测量 | 2D 姿态的匹配一致性 | **骨方向**（oriented points，对单目深度鲁棒） |
+| 网络 | `steerpose.model.SteerPose` | `steerpose.lifting.PoseLifter` |
+| 标定 | `steerpose.calibrate` | `steerpose.calib_ral` |
+| 需要 | 骨架 + 内参 | 骨架 + 内参 + 一个自由移动的个体 |
 
 ## 方法一句话
 
@@ -30,7 +46,10 @@ steer_pose/
 │   ├── data.py         3D 姿态加载、2D 归一化、训练对构建、噪声 + 10%~30% 掩码增强
 │   ├── losses.py       Lkp（式 1）、相似度（α=3）、Sinkhorn、Lmatch（式 2，双向）、Lgeom
 │   ├── train.py        训练入口（CUDA/AMP/DataLoader/日志/断点）
-│   └── calibrate.py    两视角标定+匹配的推理时优化（含最多 5 次随机重启、平移求解）
+│   ├── calibrate.py    两视角标定+匹配的推理时优化（含最多 5 次随机重启、平移求解）
+│   ├── skeleton.py     ⭐️ RA-L2022：骨架定义（19 关节 / 19 骨 / 14 根标定骨 / 根关节）
+│   ├── lifting.py      ⭐️ RA-L2022：单目 3D 提升器 PoseLifter + 骨方向损失 + 尺度不变 MPJPE
+│   └── calib_ral.py    ⭐️ RA-L2022：几何标定后端（SVD 旋转解 + 线性平移解 + z-test + BA）
 ├── scripts/
 │   ├── setup_env.sh      服务器一键配环境（conda/venv、镜像、CUDA 验证）
 │   ├── run_h100.sh       H100 推荐配置一键训练（quick / full / agnostic 三档）
@@ -38,6 +57,8 @@ steer_pose/
 │   ├── make_mock_mammal.py  生成"官方格式"的假数据，没下载数据集也能跑通全链路
 │   ├── check_mammal_data.py  ⭐️ 数据体检 + 投影一致性验证（3D GT 重投影 vs 2D 标注）
 │   ├── selftest_infer.py   ⭐️ 推理链自检（匹配矩阵 + 几何一致性 + 内参 K 通路），秒级、不依赖训练
+│   ├── selftest_calib_ral.py ⭐️ RA-L2022 几何求解器自检（48 项断言，纯 numpy/scipy）
+│   ├── selftest_lifting.py  ⭐️ RA-L2022 提升器损失/指标自检（53 项断言，CPU 张量，不含前向）
 │   ├── diag_lkp_plateau.py   ⭐️ 训练没进展时先跑这个：平凡基线 + 过拟合 + 长训练三对照
 │   ├── diag_sphere_fix.py    ⭐️ A/B：训练相机集合「上半球 vs 完整球面」（会训两个小模型，服务器上跑）
 │   ├── diag_r_ablation.py    判定网络是否真的在用 R（打乱 R 看损失变化）
@@ -46,9 +67,12 @@ steer_pose/
 │   ├── diag_data_quality.py  自编数据 vs 真实数据的 3D 结构质量（s3/s1 等）
 │   ├── prepare_data.py   任意 3D 姿态 -> poses.npz（通用）
 │   ├── prepare_mammal.py BamaPig3D 3D 标注 -> poses.npz（支持 txt 目录与 pure_pickle）
-│   └── prepare_mammal_2d.py  BamaPig3D 2D 标注 + 真值外参 -> 两视角标定输入（含 newcameramtx）
+│   ├── prepare_mammal_2d.py  BamaPig3D 2D 标注 + 真值外参 -> 两视角标定输入（含 newcameramtx）
+│   ├── prepare_mammal_lifter.py ⭐️ RA-L2022：提升器训练数据 + 多视角标定输入包
+│   └── train_lifter.py    ⭐️ RA-L2022：训练单目 3D 提升器（骨方向主损失 + 平凡基线对照）
 ├── docs/
 │   ├── paper_notes.md    论文关键细节、超参、结果、数据集、与官方实现的差异
+│   ├── ral_backend.md    ⭐️ RA-L2022 后端设计文档（三段式链路/gauge/两个陷阱/完整跑法）
 │   └── h100_tuning.md    ⭐️ H100 参数调整文档（每个参数为什么这么调 + 排障表）
 └── requirements.txt
 ```
@@ -417,7 +441,128 @@ res["W"]         # Sinkhorn 软指派矩阵
 复现的默认超参（论文附录 D.3）：Adam lr=0.01，1000 次迭代，lr 线性衰减 1.0→0.01，
 `Lgeom` 在 40% 迭代后激活，α=3，失败最多 5 次随机重启。
 
+## RA-L2022 改造：2D → 单目 3D → 外参
+
+SteerPose 本身只有 **2D→2D** 的网络，没有 3D。要把它用在猪（BamaPig3D）这类
+多物种/畜牧场景上，需要补上"单目 3D"这一环——这正是同作者前作
+**RA-L2022 `Extrinsic Camera Calibration From a Moving Person`** 做的事。
+本仓库把那条链路完整移植了进来，**设计与踩坑细节见
+[`docs/ral_backend.md`](docs/ral_backend.md)**，这里只给操作入口。
+
+### 三段式链路
+
+```
+[0] PoseLifter        每相机各自：归一化 2D -> 相机系 3D（根相对 + 骨长归一化）
+[1] 旋转解（SVD）      骨方向（oriented points）在"所有相机都可见"的骨上做 SVD
+[2] 平移解（线性）     射线共线 + 共面 -> C·x=0 的 4 维零空间（3 平移 + 1 尺度）
+[3] BA（可选）        重投影 + 跨相机骨方向一致 + 骨长一致
+```
+
+**核心洞察**：第 [1][2] 段**只用骨方向**，不用单目 3D 的绝对位置/尺度。
+单目深度不可靠，但方向可靠——所以标定精度对提升器的深度误差几乎免疫。
+
+### 完整命令
+
+```bash
+# ⓪ 数据体检（纯 numpy，秒级；先跑通就靠它）
+python scripts/check_mammal_data.py --root /data/BamaPig3D_pure_pickle
+#   预期：重投影误差中位 < 5 px
+
+# ① 提升器训练数据（论文 Table 7：训练用帧 0-1400）
+python scripts/prepare_mammal_lifter.py --root /data/BamaPig3D_pure_pickle \
+    --max-frame 1400 --out data/lifter_bamapig_train.npz
+
+# ② 训练（★ 在服务器 H100 上跑；先 --dry-run 体检数据与平凡基线）
+python scripts/train_lifter.py --npz data/lifter_bamapig_train.npz --dry-run
+python scripts/train_lifter.py --npz data/lifter_bamapig_train.npz \
+    --out ckpt/lifter_bamapig.pt --device cuda --workers 8 --steps 40000 --amp
+
+# ③ 标定输入包（论文 Table 7：帧 1400-1750）
+#    ★★ 用**相机对**，不要一次上 10 台（原因见下）
+python scripts/prepare_mammal_lifter.py --root /data/BamaPig3D_pure_pickle \
+    --min-frame 1400 --calib-cams 0,6 --no-train-out \
+    --dump-calib data/lifter_calib_c0_c6.npz
+
+# ④ 推理 + 标定：加载 ckpt -> PoseLifter 得到 p3d -> calibrate_from_lifter
+#    可复制代码片段见 docs/ral_backend.md §7
+```
+
+### 三个必须知道的点
+
+1. **损失必须是骨方向余弦，不能是普通 MPJPE。** 单目尺度不可观测，
+   用 MPJPE 当主损失会把容量浪费在"猜绝对深度"上，而标定根本不需要这个量。
+   辅助项用 `scale_invariant_mpjpe`（先各自归一到平均骨长=1 再比位置）。
+
+2. **★★ 多视角必须用相机对。** `calib_ral` 要求"同一根骨在**所有**相机都可见"，
+   所以存活率 ≈ `(单相机可见率)^相机数`。BamaPig3D 关节可见率约 65%：
+
+   | 相机数 | 存活率 | |
+   |---|---|---|
+   | **2** | ~42% | ✅ 推荐 |
+   | 10 | ~1.3% | ❌ 基本没样本 |
+
+   实测（假数据，可见率 0.971）：`--calib-cams 0,6` 保留 **91.5%** 标定骨（717 个观测）；
+   全 10 台保留 **54.7%**（429 个）。真实数据 0.65 可见率下 10 台会直接崩到 ~1%。
+
+3. **评估必须用 gauge-free 指标。** 外参只能恢复到相差一个世界系相似变换的程度：
+   相对旋转与基线**方向**可辨识，绝对姿态/位置/尺度不可辨识。
+   `alignment_error()` 打包了这套指标；注意**相机 0 是 gauge 参考，
+   它的基线方向误差天然是 `nan`，统计时要排除**。
+
+### 自检（上服务器前先跑，全部纯 numpy/scipy、不训练不推理）
+
+```bash
+python scripts/selftest_calib_ral.py    # 几何求解器 48 项断言
+python scripts/selftest_lifting.py      # 损失/指标/数据集 53 项断言（CPU 张量，不含前向）
+python scripts/selftest_lifting.py --allow-model   # 连前向一起测
+```
+
+假数据端到端闭环（不训练、不推理）：
+
+```bash
+python scripts/make_mock_mammal.py --out /tmp/mock_bamapig
+python scripts/prepare_mammal_lifter.py --root /tmp/mock_bamapig \
+    --min-frame 1400 --calib-cams 0,6 --no-train-out --dump-calib /tmp/cal.npz
+# 把**精确 GT** 当"提升器输出"喂进 calib_ral，线性解应精确恢复真值外参
+```
+
 ## 实现修正记录
+
+### 第四批（2026-09-16）：RA-L2022 后端（新增）+ 提升器损失的掩码 bug
+
+**新增**：`steerpose/skeleton.py`、`steerpose/lifting.py`、`steerpose/calib_ral.py`
+（RA-L2022 几何标定后端），配套 `scripts/prepare_mammal_lifter.py`、
+`scripts/train_lifter.py`、`scripts/selftest_lifting.py`。
+设计文档见 [`docs/ral_backend.md`](docs/ral_backend.md)。
+
+开发/移植过程中修掉的坑（**都不是训练曲线能看出来的**，全部靠 numpy 自检发现）：
+
+| # | 位置 | 问题 | 后果 | 修正 |
+|---|------|------|------|------|
+| 1 | `lifting.bone_direction_loss` 等 | 损失**不看关节掩码**。预处理把未标注关节的 3D 目标填 0，于是一根骨只要有一端缺失，其"目标方向"就变成 `Y3[有效端] - 0` —— **一个数值很大的错误向量** | 训练不报错、loss 照降，但网络被**主动推向虚假方向**（长尾关节越多越糟） | 新增 `_bone_valid_weight`，只在"两端都可见"的骨上求平均；`bone_direction_loss` / `bone_direction_error_deg` / `mpjpe` / `procrustes_mpjpe` 全部支持可选 `mask`。`selftest_lifting.py` C 节是回归测试（同时验证"坑确实存在"与"修完梯度精确为 0"） |
+| 2 | `lifting.bone_direction_error_deg` | 用 `arccos(v·g)` 算角度。**arccos 在 1 附近是平方根型病态**的：float32 下 `cos` 因舍入掉到 1-6e-8，角度就跳到 ~0.006° | "完全相同"的两个姿态也报出非零误差，误差指标有底噪，小误差区间完全不可信 | 改用 `atan2(|v×g|, v·g)`（v==g 时叉积严格为 0 → **精确 0**）。与 `calib_ral._so3_angle` / `_vec_angle` 同一处理 |
+| 3 | `calib_ral._objfun_nll` | BA 的重投影残差**漏乘 K**（参考实现是 `y_hat = K @ (R @ x.T + t)`） | 残差量纲错位（归一化坐标 vs 像素，差 fx≈1340 倍），BA **直接发散**：cost 冲到 3.8e28 | 改为 `P = Ki @ (Ri @ xx.T + t)`；修完在干净数据上 2 步收敛、cost 2.3e-23 |
+| 4 | `calib_ral.dlt_batch` | 批量 DLT 的 `AtA` **忘记沿相机轴 `.sum(axis=0)`** | 退化成"单视角 DLT"，三角化 3D 全错 → BA 的初值 `/0` → NaN | 补上求和，并抽出 `dlt_batch` 单独测试；对无解点加 NaN/均值兜底 |
+| 5 | `calib_ral._build_C` | COO 三元组构造有四处索引错：共面块列索引漏了 `3*M` 偏移、行索引写成 `3*p*M+...`（应为 `p*M+...`）、`rows/cols/vals` 追加不配对 | 稀疏矩阵维度/长度不匹配，或**静默算出错的平移解** | 用参考实现的 `lil_matrix` 版本做对照，逐块比对：`max|Δ| = 4.44e-16`。另把旋转矩阵角度换算改成 `atan2(‖skew‖, trace)`，消掉 ~6e-7° 的浮点底噪 |
+| 6 | `calib_ral.solve_translation` | 未知量排布是 `[X_0..X_{M-1}, t_0..t_{C-1}]`，但取 `t_0` 的行时忘了前面的 `M*3` 偏移（写成了前 3 行，实际应是第 `M*3` 行起） | 拿去消 gauge 的不是 `t_0` 而是 `X_0` → 平移 gauge 根本没固定住，解整体偏移 | 改为 `t0_rows = k[M*3 : M*3+3, :]` |
+
+**验证方式**（纯 numpy/scipy，本机可跑，不涉及任何训练/推理）：
+
+```bash
+python scripts/selftest_calib_ral.py    # 48/48 通过（干净数据；加噪 45/45）
+python scripts/selftest_lifting.py      # 53/53 通过
+```
+
+外加一条端到端闭环：把假数据的**精确 GT 相机系 3D** 当"提升器输出"喂进
+`calibrate_from_lifter`，线性解应**精确**恢复真值外参。实测：
+
+| 配置 | 旋转误差 | 基线方向误差 | 恢复的 `scale` |
+|---|---|---|---|
+| 相机对 (0,6) | 1.0e-14° | 4.5e-14° | **7.6084** m（= √(7.236²+2.351²)，真值基线） |
+| 全 10 台 | 4.5e-14° | 7.4e-13° | **2.4721** m（= 2·4·sin18°，真值基线） |
+
+`scale` 精确等于真实基线长度，说明"世界→相机"转换、外参口径、骨架 bones 三者
+**完全自洽**。（相机 0 是 gauge 参考，其基线方向误差恒为 `nan`，统计需排除。）
 
 ### 第一批（2026-09-16）：推断链三个隐蔽 bug
 
@@ -487,9 +632,23 @@ python -m steerpose.calibrate --ckpt <权重> --demo   # 看 Lgeom 是否真正�
 - ✅ 已验证：推理链（匹配矩阵 + 几何一致性 + 平移求解 + 内参 K 通路）由 `scripts/selftest_infer.py`
   以合成真值场景逐项验证（17 项检查全通过，`Lgeom` 真值/随机对比度 ~700×，t 方向误差 0.02°，
   像素↔归一化坐标往返偏差 1.1e-16）；
+- ✅ 已验证：RA-L2022 几何后端（SVD 旋转解 + 线性平移解 + z-test 手性 + BA）——
+  `scripts/selftest_calib_ral.py` **48/48** 通过（干净数据；加噪 45/45），
+  且"精确 GT 相机系 3D → 外参"的端到端闭环误差 ~1e-14°、恢复的基线长度精确等于真值；
+- ✅ 已验证：提升器的损失/指标/数据集契约——`scripts/selftest_lifting.py` **53/53** 通过
+  （含"骨方向损失对尺度/平移免疫"与"无效关节填 0 的伪方向"两条关键回归测试）；
+- ✅ 已验证：`prepare_mammal_lifter.py` 在官方格式假数据上端到端跑通
+  （训练数据 + 多视角标定输入包，含全视角存活率诊断）；
+- ⬜ 未训练：提升器本身的**精度**未在本机测过（按约定不在本机跑模型）。
+  需在服务器上 `scripts/train_lifter.py` 训练后，用 `calibrate_from_lifter` 评。
+  假数据上的平凡基线参考值：正交提升 **33.6°** / 平均姿态 **50.7°**（骨方向误差），
+  模型必须明显低于前者才算学到东西；
 - ⬜ 未实现：多视角整合（motion averaging + 循环一致匹配 + bundle adjustment，论文第 4 节）——
-  可参考同作者前作 [RA-L 2022 代码](https://github.com/kyotovision-public/extrinsic-camera-calibration-from-a-moving-person)（MIT），
-  其中的共线/共面约束、chirality check 与 BA 是 SteerPose 几何部分的技术来源；
+  可参考同作者前作 [RA-L 2022 代码](https://github.com/kyotovision-public/extrinsic-camera-calibration-from-a-moving-person)
+  （MIT）。注意：本仓库已移植其**共线/共面约束、chirality check 与 BA**
+  （`steerpose/calib_ral.py`），但"10 台相机联合标定"目前仍需**两两配对**后自行拼合——
+  原因是几何后端要求"同一根骨在所有相机可见"，10 台时存活率掉到 ~1%，见
+  [`docs/ral_backend.md`](docs/ral_backend.md) §6.2；
 - ⬜ 未做：与 MAMMAL / 3D-PoP / AcinoSet 的定量对比复现（需要数据集与逐类目 2D 姿态估计器）；
 - ⚠️ 与官方实现的可能差异见 `docs/paper_notes.md` 第 8 节。
 
@@ -524,6 +683,19 @@ python -m steerpose.calibrate --ckpt ckpt/demo_best.pt --demo --iters 1000
 ② 权重训够了没（`--demo` 场景下 val Lkp 要远低于平凡基线 0.648）；
 ③ `python scripts/selftest_infer.py` 是否 17 项全通过。这三项都正常时 `Lgeom` 必然参与，
 日志会打印"使用 N 对匹配"。详细根因见文末"实现修正记录 · 第三批"。
+
+**Q: `calib_ral` 返回 `nan` 或者标定明显不对，怎么查？**
+按顺序：① 跑 `python scripts/selftest_calib_ral.py`，48 项全过说明求解器本身没问题；
+② 检查是不是**用了全部 10 台相机**——几何后端要求"同一根骨在所有相机可见"，
+10 台时存活率只有 ~1%，骨观测太少必然不稳，请改用 `--calib-cams 0,6`；
+③ 看日志里的 `零空间 4 维` 与 `w[3]/w[4]`：退化时会打印 `⚠️ 退化`，说明有效样本太少；
+④ 评估时记得**排除相机 0**（它是 gauge 参考，基线方向误差天然是 `nan`）。
+详见 [`docs/ral_backend.md`](docs/ral_backend.md) §6。
+
+**Q: 提升器的骨方向误差报出来是 0，正常吗？**
+正常，而且是**特意做的**。误差指标用 `atan2(|v×g|, v·g)` 而不是 `arccos(v·g)`——
+`arccos` 在 1 附近是平方根型病态的，float32 下"完全相同的姿态"也会报出 ~0.006°。
+换成 `atan2` 后相同姿态给出**精确 0**。所以小误差区间才可信。
 
 **Q: 服务器上怎么后台跑训练？**
 ```bash
