@@ -8,8 +8,10 @@
 - Lgeom  : 对当前 R 下的匹配对，由共线约束构造线性系统
            A [x_1 ... x_N t]^T = 0（x_i 为 3D 点沿相机 A 视线的深度，t 为相对平移），
            取最小与次小奇异值之比 σ1/σ2，迫使 R 使 t 有解。
-           注意：Lgeom 必须用**整场景归一化**坐标（normalize_scene），
-           逐姿态归一化会抹掉位置信息导致 t 不可辨识。
+           注意：Lgeom 必须传**按内参归一化的图像坐标**（to_ray_coords 的输出，
+           即 (u-cx)/fx, (v-cy)/fy）。逐姿态包围盒归一化（data.normalize_pose）
+           会连位置一起抹掉，t 就不可辨识；焦距/主点填错也会改变射线方向，
+           让正确的 R 不再对应零奇异值，且不会报错，只是结果变差。
 """
 import math
 import numpy as np
@@ -102,7 +104,7 @@ def guess_focal(P: np.ndarray, focal: float = None) -> float:
 
 
 def to_ray_coords(P: np.ndarray, focal: float = 1.0,
-                  principal_point=None) -> np.ndarray:
+                  principal_point=None, K: np.ndarray = None) -> np.ndarray:
     """2D 坐标 -> 归一化图像坐标 (x-cx)/f, (y-cy)/f —— 保留真实射线几何。
 
     **关键**：几何约束必须用"按焦距归一化"的坐标，因为归一化图像坐标下的视线方向
@@ -110,12 +112,18 @@ def to_ray_coords(P: np.ndarray, focal: float = 1.0,
     最大边），相当于把焦距悄悄改成了那个尺度，每条射线的方向都被改变，正确的 R 就
     不再对应零奇异值，Lgeom 会失去判别力。
 
-    principal_point 默认取所有点的均值（无内参时的常用代理）；有标定内参时请显式传入。
+    优先用 K（3x3 内参，fx/fy/cx/cy 都取自它）；否则用
+    (P - principal_point) / focal。principal_point 默认取所有点的均值。
 
     与网络输入用的逐姿态归一化（data.normalize_pose）是两回事：
     网络只看姿态**形状**，几何约束还需要姿态在图像中的**位置**。
     """
     P = np.asarray(P, np.float64)
+    if K is not None:
+        K = np.asarray(K, np.float64)
+        if K.shape != (3, 3):
+            raise ValueError(f"K 形状应为 (3,3)，实际 {K.shape}")
+        return (P - K[:2, 2]) / np.array([K[0, 0], K[1, 1]], np.float64)
     if principal_point is None:
         principal_point = P.reshape(-1, 2).mean(0)
     return (P - np.asarray(principal_point, np.float64)) / float(focal)
@@ -156,7 +164,10 @@ def build_linear_system(Qg: torch.Tensor, P2g: torch.Tensor,
     即 A 的最小奇异值 → 0。
 
     参数
-      Qg, P2g : 视角 A / B 的 2D 坐标，**整场景归一化**（normalize_scene），保留位置
+      Qg, P2g : 视角 A / B 的 2D 坐标，**按各自内参归一化的图像坐标**
+                （to_ray_coords 的输出，即 (u-cx)/fx, (v-cy)/fy），保留位置信息。
+                不要传 data.normalize_pose 的逐姿态包围盒归一化结果 —— 那会把
+                位置与射线方向一起改掉。
       pairs   : (N, 2) 匹配索引对
       reduce  : 'centroid' 每对匹配姿态取质心作一个 3D 点（论文口径，默认，矩阵小）
                 'joints'   逐关节作 3D 点（约束更多，矩阵大 N×J 倍）
@@ -191,9 +202,32 @@ def build_linear_system(Qg: torch.Tensor, P2g: torch.Tensor,
     return A
 
 
+def geom_conf_threshold(W: torch.Tensor) -> float:
+    """几何项筛选可靠匹配的置信度阈值（随集合大小自适应）。"""
+    return max(0.3, 2.0 / max(W.shape[0], W.shape[1]))
+
+
+def confident_pairs(W: torch.Tensor, conf_thr: float = None):
+    """从软指派 W 里挑出可靠匹配 -> (pairs (N,2), conf_thr)。
+
+    单独抽出来是为了让调用方能报告"几何项实际用了多少对匹配"：当 SteerPose
+    还没训练好、Sinkhorn 输出接近均匀指派时，W 的行最大置信度处处小于阈值，
+    Lgeom 会静默地退化成 0（不报错），从损失曲线上完全看不出几何项其实没参与。
+    """
+    if conf_thr is None:
+        conf_thr = geom_conf_threshold(W)
+    conf, bidx = W.max(dim=1)
+    aidx = torch.arange(W.shape[0], device=W.device)
+    sel = conf > conf_thr
+    if sel.sum().item() == 0:
+        return torch.zeros((0, 2), dtype=torch.long, device=W.device), conf_thr
+    return torch.stack([aidx[sel], bidx[sel]], dim=1), conf_thr
+
+
 def geometric_loss(Qg: torch.Tensor, P2g: torch.Tensor, W: torch.Tensor,
                    R: torch.Tensor, conf_thr: float = None,
-                   reduce: str = "centroid", max_pts: int = 512) -> torch.Tensor:
+                   reduce: str = "centroid", max_pts: int = 512,
+                   stats: dict = None) -> torch.Tensor:
     """Lgeom = σ1/σ2（论文 3.2 节）——最小奇异值 / 次小奇异值。
 
     论文原文："the singular values σ2 ≥ σ1 ... we include the ratio σ1/σ2 as a loss
@@ -204,6 +238,8 @@ def geometric_loss(Qg: torch.Tensor, P2g: torch.Tensor, W: torch.Tensor,
     注意：这里必须传**整场景归一化**的 2D 坐标（normalize_scene），不是逐姿态归一化。
 
     用软指派 W 的行最大置信度筛选可靠匹配；阈值随集合大小自适应。
+    传 stats（dict）时会把诊断信息写进去：n_pairs / active / conf_thr，
+    便于区分"几何项正常工作"和"匹配不可信导致几何项被跳过"。
     """
     if W is None or W.numel() == 0:
         return torch.zeros((), device=R.device)
@@ -212,20 +248,20 @@ def geometric_loss(Qg: torch.Tensor, P2g: torch.Tensor, W: torch.Tensor,
             f"匹配矩阵 W 形状 {tuple(W.shape)} 与两个视角的目标数 "
             f"({Qg.shape[0]}, {P2g.shape[0]}) 不一致。W[i, j] 表示 Q 的第 i 个姿态"
             f"指派给 P2 的第 j 个姿态，必须是二维 (B1, B2)。")
-    conf, bidx = W.max(dim=1)
-    aidx = torch.arange(W.shape[0], device=W.device)
-    if conf_thr is None:
-        conf_thr = max(0.3, 2.0 / max(W.shape[0], W.shape[1]))
-    sel = conf > conf_thr
-    if sel.sum().item() < 3:               # 匹配太少，几何项无意义
+    pairs, conf_thr = confident_pairs(W, conf_thr)
+    if stats is not None:
+        stats["conf_thr"] = float(conf_thr)
+        stats["n_pairs"] = int(pairs.shape[0])
+    if pairs.shape[0] < 3:                 # 匹配太少，几何项无意义
         return torch.zeros((), device=W.device)
-    pairs = torch.stack([aidx[sel], bidx[sel]], dim=1)
     if pairs.shape[0] > max_pts:           # 控制 SVD 规模
         step = max(1, pairs.shape[0] // max_pts)
         pairs = pairs[::step][:max_pts]
     A = build_linear_system(Qg, P2g, pairs, R, reduce=reduce)
     if A is None:
         return torch.zeros((), device=W.device)
+    if stats is not None:
+        stats["active"] = True
     s = torch.linalg.svdvals(A)          # torch 返回**降序**
     return s[-1] / (s[-2] + 1e-12)       # σ_min / σ_2ndmin -> 0 表示存在合法 t
 

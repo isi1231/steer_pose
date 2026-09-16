@@ -71,10 +71,15 @@ class PosePairDataset(Dataset):
 
 
 def build_pairs(poses3d: np.ndarray, num_pairs: int = 3000, num_views: int = 100,
-                num_rolls: int = 20, seed: int = 0) -> dict:
-    """按论文附录 D.1 合成 (P, P', R) 训练对。"""
+                num_rolls: int = 20, seed: int = 0, full_sphere: bool = True) -> dict:
+    """按论文附录 D.1 合成 (P, P', R) 训练对。
+
+    full_sphere=True（默认）用完整球面视点，覆盖全部 SO(3)；
+    只用上半球（False）会让训练集缺失一半朝向，推理时遇到"镜像视角"
+    （等价于从下半球看）会给出完全错误的结果。详见 geometry.ViewSynthesizer。
+    """
     vs = ViewSynthesizer(num_views=num_views, num_rolls=num_rolls,
-                         num_pairs=num_pairs, seed=seed)
+                         num_pairs=num_pairs, seed=seed, full_sphere=full_sphere)
     return vs.make_training_set(poses3d)
 
 

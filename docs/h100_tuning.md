@@ -4,20 +4,26 @@
 
 ---
 
-## ⚠️ 上手前必读：先跑推理链自检（5 秒）
+## ⚠️ 上手前必读：先跑数据体检 + 推理链自检（都是秒级）
 
 ```bash
+# 1) 数据体检：3D GT 用官方外参+内参投影回图像 vs 官方 2D 标注
+#    重投影误差小 → 骨架顺序 / 外参约定 / 内参口径 / 2D 坐标系四项一次全对
+python scripts/check_mammal_data.py --root /data/BamaPig3D_pure_pickle
+
+# 2) 推断链自检：不依赖训练、不依赖数据集，用合成真值场景验证 calibrate 的三处要害
+#    （匹配矩阵形状/归一化、几何一致性项方向与平移求解、内参 K 通路）
 python scripts/selftest_infer.py
 ```
 
-它不依赖训练、不依赖数据集，用合成真值场景验证 `calibrate` 推断链的两处要害
-（匹配矩阵形状/归一化、几何一致性项的方向与平移求解）。**训练损失 `Lkp` 不经过这两条
-路径**，所以 `Lkp` 下降完全不能说明它们是对的——本仓库就曾因此藏过三个隐蔽 bug
-（详见 README "实现修正记录"）。
+**训练损失 `Lkp` 不经过匹配与几何这两条路径**，所以 `Lkp` 下降完全不能说明它们是对的
+——本仓库就曾因此藏过三个隐蔽 bug（详见 README "实现修正记录"）。
 
-另外，**档位 A（quick）只用于验证链路能否跑通，不足以产出可用的标定结果**。
-若拿 quick 的权重去 `calibrate`，你会看到 R 误差接近随机、t 解不出来——这不是代码问题，
-而是模型区分度不够。标定必须用档位 B（full）的权重。
+另外，**档位 A（quick）容易让人误判**：它的定位是"跑通链路"，但步数给少时
+val Lkp 会一直贴在平凡基线上（≈0.65），打乱 R 也不影响损失——**看起来像数据或实现坏了，
+其实只是没训够**。所以现在 quick 档也给了约 1.2 万步，且在日志里显式打印总步数与基线；
+拿 quick 的权重去 `calibrate` 若仍看到 R 误差接近随机、`几何项 Lgeom：使用 0 对匹配`，
+优先加步数，不要改数据。详见第 0 节末尾。
 
 ---
 
@@ -35,38 +41,74 @@ python scripts/selftest_infer.py
 ② 与其跑一个超长训练，不如**跑一个小规模超参扫描**（每轮几分钟），挑 val Lkp 最低的配置；
 ③ `--workers` 要比 GPU 训练常规设置更大，因为瓶颈在喂数据。
 
+### ⚠️ 但是：epoch 便宜 ≠ 步数够。唯一要看的是"总优化步数"
+
+```
+总步数 = ceil(训练对数 / batch) × epochs
+```
+
+`--batch` 一开大，每轮步数就掉下来，`--epochs` 看着不小、总步数其实很少。
+本仓库踩过这个坑：`epochs=50 / batch=512 / pairs=3000` → 每轮只有 5 步，**总计 250 步**，
+模型停在"输出平均姿态"上完全没动，从日志上看像数据或实现坏了。实测对照（同一份数据、同一实现）：
+
+| 总步数 | val Lkp | 打乱 R 后的 ΔLkp | 模型状态 |
+|--------|---------|------------------|----------|
+| 250 | 0.6356 | +0.0195 | **完全忽略 R**（Δ 几乎为 0 = 没在看旋转输入） |
+| 2000 | 0.1325 | — | 开始真正使用 R |
+| 16500 | **0.0506** | +0.7741 | 正常 |
+
+参照：平凡基线（无论输入都输出平均姿态）= **0.6481**。
+
+`train.py` 现在会把这两行写进日志，**先看它们再决定要不要调参**：
+
+```
+[i] 优化规模：每轮 9 步 × 1400 epoch = 共 12600 步
+[i] 平凡基线（输出平均姿态）val Lkp = 0.6489
+```
+
+val Lkp 与基线相近时，日志末尾会显式警告并给出处理顺序（优先加 `--epochs`、
+其次调小 `--batch`）。`scripts/run_h100.sh` 已改为**按目标总步数反推 epoch**。
+
+复现这套对照：`python scripts/diag_lkp_plateau.py`（基线 + 过拟合 + 长训练），
+`python scripts/diag_r_ablation.py`（R 消融，判定模型是否真的在用 R）。
+
 ---
 
 ## 1. 推荐参数（三档配置）
 
-### 档位 A：先验证链路（首次上服务器，5 分钟内出结果）
+> 三档都由 `scripts/run_h100.sh` 按目标总步数自动折算 epoch，下面列出的 epoch 数
+> 是按 `--num-pairs` 与 `--batch` 换算后的**结果**，换数据量时会自动变。
+
+### 档位 A：先验证链路 + 拿到一个"真的学到了东西"的权重
 
 ```bash
 python -m steerpose.train \
     --poses3d data/poses_bamapig_train.npz \
-    --epochs 30 --batch 512 --workers 4 --num-pairs 3000 \
-    --device cuda --amp --out ckpt/smoke.pt --log-every 5
+    --epochs 4000 --batch 256 --workers 4 --num-pairs 3000 \
+    --device cuda --amp --out ckpt/smoke.pt --log-every 200
 ```
-用途：确认环境、数据、显存都没问题。看 `epoch 30 val Lkp` 是否明显低于初始值（初始 ≈ 0.6~0.7）。
+用途：确认环境、数据、显存都没问题。**判据不是"跑完了"，而是日志里
+`val Lkp` 明显低于同一行上下方的平凡基线**（一般要降到 0.2 以下才算开始有用）。
 
 ### 档位 B：正式训练 BamaPig3D（推荐，10~20 分钟）
 
 ```bash
 python -m steerpose.train \
     --poses3d data/poses_bamapig_train.npz \
-    --epochs 400 --batch 4096 --lr 1e-3 --weight-decay 1e-5 \
+    --epochs 3000 --batch 1024 --lr 1e-3 --weight-decay 1e-5 \
     --workers 12 --num-pairs 20000 --num-views 100 --num-rolls 20 \
-    --amp --seed 0 --log-every 20 --save-every 100 \
+    --amp --seed 0 --log-every 150 --save-every 750 \
     --out ckpt/bamapig.pt
 ```
+（= 每轮 14 步 × 3000 = 约 4.2 万步，是实测 1.65 万步的 2.5 倍余量。）
 
 ### 档位 C：class-agnostic 模型（Animal3D 40 物种，1~2 小时）
 
 ```bash
 python -m steerpose.train \
     --poses3d data/poses_animal3d.npz \
-    --epochs 800 --batch 8192 --lr 1e-3 \
-    --workers 16 --num-pairs 50000 --amp --seed 0 --log-every 25 \
+    --epochs 1000 --batch 2048 --lr 1e-3 \
+    --workers 16 --num-pairs 50000 --amp --seed 0 --log-every 50 \
     --out ckpt/animal3d_agnostic.pt
 ```
 
@@ -84,6 +126,7 @@ python -m steerpose.train \
 | `--amp` | 关 | **开**（bf16） | H100 原生支持 bf16。对速度提升有限（模型太小），但白拿；不会影响精度 |
 | `--weight-decay` | 0 | **1e-5** | 数据量小（228 姿态）容易过拟合，加一点点正则 |
 | `--num-views` / `--num-rolls` | 100 / 20 | **100 / 20（保持论文设置）** | 视角采样密度直接决定模型对旋转的分辨能力，不建议改小；想更密可试 200/40（合成代价线性增长） |
+| `--cameras` | sphere | **sphere（不要改）** | ⭐️ 视点必须在**完整单位球面**上取。早期实现只取上半球（z ≥ 0.05），等价于只覆盖一半旋转群，训练集里不存在"镜像视图"：训练曲线完全正常，但推理时遇到这类视角（例如 `calibrate --demo` 的相机 A = 单位矩阵）网络输出全错 → 跨视角匹配 0/12 → `Lgeom` 静默为 0。`hemisphere` 只为 A/B 对照保留（`python scripts/diag_sphere_fix.py`，服务器上跑） |
 | `--seed` | 0 | 扫描时 **0/1/2 各跑一次** | 228 个姿态 + 随机视角对，方差较大；单次结果的偶然性高 |
 
 ---
@@ -135,11 +178,12 @@ python -m steerpose.calibrate \
 | `--lambda-geom` | 1.0 | Lgeom 权重 λ；若结果旋转误差大但匹配看着对，可上调到 2~5 试 |
 | `--alpha` | 3.0 | 相似度 `s = 2/(1+exp(α·Lkp))` 的缩放，论文附录 D.3 明确给出 |
 | `--retries` | 5 | 失败换随机初始 R，论文设置 |
-| `--focal` | — | **必看**。几何项把 2D 坐标当归一化图像坐标（视线 = `(u,v,1)`），所以坐标必须按焦距归一化。输入是像素坐标时传 `--focal <像素焦距>`（估不准就用 `0.9 × 图像长边`）；不传会按数据量级自动估。**不要**传按包围盒缩放的坐标——缩放会改变射线方向，使正确的 R 不再对应零奇异值 |
+| `--focal` | — | 几何项把 2D 坐标当归一化图像坐标（视线 = `(u,v,1)`），所以坐标必须按焦距归一化。**优先用内参**：`--K-file <file>` 或直接用 `prepare_mammal_2d.py` 产出的 npz（内含 `K`，即 BamaPig3D 去畸变后的 `newcameramtx`，fx≈1340）。没有内参时才传 `--focal`（估不准就用 `0.9 × 图像长边`）。**不要**传按包围盒缩放的坐标——缩放会改变射线方向，使正确的 R 不再对应零奇异值 |
 | Lgeom 激活时机 | 总迭代的 40% 之后 | 脚本内置（等匹配先稳定） |
 
-标定结束会打印 **匹配置信度**（平均最大指派概率 + 可信匹配数）。若 < 0.5 说明
-Sinkhorn 接近均匀指派、R 与 t 都不可信 —— 此时应先解决模型区分度问题，而不是调标定参数。
+标定结束会打印 **匹配置信度**（平均最大指派概率 + 可信匹配数）与 **几何项用了几对匹配**。
+若置信度 < 0.5，或几何项标注"不足 3 对，Lgeom 静默失效"，说明 Sinkhorn 接近均匀指派、
+R 与 t 都不可信 —— 此时应先解决模型区分度问题，而不是调标定参数。
 
 **多相机（10 视角）**：逐对跑（10 视角有 45 对），再用 motion averaging + BA 统一坐标系——
 这部分本仓库未实现，可参考 `docs/paper_notes.md` 第 5 节的提示。
@@ -173,12 +217,15 @@ ckpt/bamapig_config.json     本次超参留档（复现必备）
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
-| `val Lkp` 卡在 0.6~0.7 不降 | 模型在输出"平均姿态" | 检查数据是否真的读了（`[i] 3D 姿态: N 个 x 19 关节`）；N 太小（<50）就先补数据；确认 `--num-pairs` 是否够大 |
-| `val Lkp` 降了但标定结果差 | 模型区分度不足（正确配对和错误配对的姿态距离接近） | 先跑 `python scripts/selftest_infer.py` 排除实现问题；再加大 `--num-pairs` 与 `--epochs`；标定输出里的"匹配置信度" < 0.5 就是这个原因 |
-| 拿 quick 档位的权重去标定，R 误差 ≈ 随机 | quick 只验证链路，模型没有区分度 | 换 `full` 档位（400 epoch / 20000 pairs）重训；这不是 bug |
-| Lgeom 恒为 0 | 可靠匹配置信度低于阈值（<0.3） | 先解决上面的模型区分度问题；Lgeom 在匹配稳定前不会有贡献（这也是论文把它放在 40% 迭代后才激活的原因） |
+| `val Lkp` 卡在 0.6~0.7 不降 | **总优化步数不够** —— 模型还没开始学，只是在输出"平均姿态" | 看日志的"优化规模"与"平凡基线"两行；先加 `--epochs`，再考虑调小 `--batch`。用 `scripts/diag_lkp_plateau.py` 复核：同数据 250 步 → 0.64（贴基线），2000 步 → 0.13 |
+| `val Lkp` 降了但标定结果差 | 模型区分度不足（正确配对和错误配对的姿态距离接近） | 先跑 `python scripts/selftest_infer.py` 排除实现问题；再加大总步数（不是只加 `--num-pairs`）；标定输出里的"匹配置信度" < 0.5 就是这个原因 |
+| 拿 quick 档位的权重去标定，R 误差 ≈ 随机 | quick 档的步数不足以让模型学会使用 R | 换 `full` 档位重训；用 `scripts/diag_r_ablation.py` 可以直接验证"打乱 R 是否影响损失" |
+| Lgeom 恒为 0 | 可靠匹配置信度低于阈值（自适应，至少 0.3），不足 3 对时按约定返回 0 | **按顺序查三件事**：① `--cameras` 是 `sphere` 吗（半球会让镜像视角落在分布外，`calibrate --demo` 直接崩）；② 权重步数够不够；③ `scripts/selftest_infer.py` 是否全通过。看日志是否标了"不足 3 对，Lgeom 静默失效"：是则是匹配区分度问题（先解决上一行），不是几何项实现问题；Lgeom 在匹配稳定前不会有贡献（这也是论文把它放在 40% 迭代后才激活的原因） |
+| `calibrate --demo` 匹配全错、ER ≈ 80°、Lmatch 停在 ~17 | 训练相机集合只覆盖上半球，而 `--demo` 场景的相机 A 是单位矩阵（正交下等价于"从下方看"的镜像视角）→ 网络输入落在分布外 | 用 `--cameras sphere` 重训（**默认值即为此**，除非你手动改过）。根因与证据链见 README『实现修正记录 · 第三批』 |
 | `t` 解出来是 `[0,0,0]` | 可信匹配不足 3 个，脚本按约定返回零向量 | 同上，属于区分度问题而非求解器问题 |
 | 几何项报 `W 形状与目标数不一致` | 匹配矩阵维度不对（`pose_distance` 被写成 cdist 的典型症状） | 跑 `scripts/selftest_infer.py` 的 M1 组；M1 会直接指出形状错误 |
+| 标定日志里焦距/主点看着不对（如 fx=1728） | 没有走内参通路，退化成 `0.9 × 图像长边` 的猜测值 | 用 `--poses-npz`（内含 `K`）或显式 `--K-file`；BamaPig3D 应为 `newcameramtx`，fx≈1340 |
+| `_best.pt` 没生成 / 日志末尾 `best val Lkp inf` | 旧版把最佳权重的保存条件写在 `% log_every` 里，`--epochs` 不是 `log_every` 整数倍时永不触发 | 已修（末轮强制评估）；若仍出现，检查 `--log-every` 是否大于 `--epochs` |
 | GPU 利用率低 | 数据侧瓶颈 | 加 `--workers`；`--num-pairs` 一次性合成完后不应再重复 |
 | 显存 OOM | 基本不可能（<1GB） | 若真出现，是其它进程占用 |
 | 训练太慢 | 用了 CPU | 加 `--device cuda`；确认 `torch.cuda.is_available()` 为 True |
@@ -190,7 +237,9 @@ ckpt/bamapig_config.json     本次超参留档（复现必备）
 
 跑完一遍后，对照检查以下项是否一致（能定位大部分复现偏差）：
 
-- [ ] `python scripts/selftest_infer.py` 全通过（13 项），且**放在任何改动之后重跑**
+- [ ] `python scripts/selftest_infer.py` 全通过（17 项），且**放在任何改动之后重跑**
+- [ ] `python scripts/check_mammal_data.py --root <pure_pickle>` 重投影误差中位 < 5 px
+- [ ] 标定用的是内参 `newcameramtx`（fx≈1340），不是原始 K（1625）也不是猜测的 0.9×长边
 - [ ] 关节数 19，顺序为 nose, l/r_eye, l/r_ear, l/r_shoulder, l/r_elbow, l/r_paw, l/r_hip, l/r_knee, l/r_foot, tail, center
 - [ ] 训练用帧 ≤1400（论文 Table 7），得到约 228 个 3D 姿态
 - [ ] 视角对 3000+，100 视点 × 20 滚转，**正交投影**（论文附录 D.1）

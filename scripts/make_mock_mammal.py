@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 """生成"官方格式"的 BamaPig3D 假数据，用于在没有 8GB 数据集时跑通/自测整条链路。
 
-生成的文件完全按官方命名与结构（见 anl13/MAMMAL_datasets）：
+生成的文件完全按官方命名与结构（见 anl13/MAMMAL_datasets，已对照真实压缩包核对）：
     <out>/label_3d/pig_{pig}_frame_{frame:06d}.txt     23x3，第 18/20/22/23 行恒为 0
-    <out>/label_3d.pkl                                  (70, 4, 23, 3)  与官方精简版同构
+    <out>/label_mix.pkl                                 (70, 4, 23, 3)  19 关节全部有效
+    <out>/label_mesh.pkl                                同上
+    <out>/label_3d.pkl                                  (70, 4, 23, 3)  带关节缺失
     <out>/label_keypoints2d.pkl                         (70, 10, 4, 19, 3)  (x, y, valid)
     <out>/extrinsic_camera_params/{camid:02d}.txt       6 个数：axis-angle + 平移（米）
-    <out>/camids.txt                                    10 个相机 ID
+    <out>/intrinsic_camera_params/distortion_info.pkl   内参（含 newcameramtx）
+（官方目录里没有 camids.txt，相机序号由文件名推断；这里保持一致。）
+
+2D 标注由 **3D GT + 外参 + 内参透视投影** 生成，所以在 2D 标注上重新投影 3D GT
+应当得到接近 0 的重投影误差 —— 这正是 `scripts/check_mammal_data.py` 要验证的闭环。
 
 骨架按官方 19 关节定义（nose, eyes, ears, shoulders… tail, center），
 姿态是程序化生成的四足行走动作，**仅用于验证代码链路，不能用于任何精度结论**。
@@ -15,13 +21,13 @@
 用法:
     python scripts/make_mock_mammal.py --out /tmp/mock_bamapig
     # 之后即可完整走一遍：
-    python scripts/prepare_mammal.py --src /tmp/mock_bamapig/label_3d --max-frame 1400 \\
-        --out data/poses_mock.npz
+    python scripts/check_mammal_data.py --root /tmp/mock_bamapig     # ← 先体检
+    python scripts/prepare_mammal.py --src /tmp/mock_bamapig/label_mix \\
+        --max-frame 1400 --out data/poses_mock.npz
     python -m steerpose.train --poses3d data/poses_mock.npz --epochs 50 --batch 256 \\
         --workers 0 --device cuda --out ckpt/mock.pt
-    python scripts/prepare_mammal_2d.py --kp2d /tmp/mock_bamapig/label_keypoints2d.pkl \\
-        --extrinsics /tmp/mock_bamapig/extrinsic_camera_params --cam-a 0 --cam-b 6 \\
-        --out data/two_view_mock.npz
+    python scripts/prepare_mammal_2d.py --root /tmp/mock_bamapig \\
+        --cam-a 0 --cam-b 6 --out data/two_view_mock.npz
     python -m steerpose.calibrate --ckpt ckpt/mock_best.pt --poses-npz data/two_view_mock.npz
 """
 import argparse
@@ -35,6 +41,18 @@ NUM_FRAMES = 70          # 官方标注帧数
 FRAME_STEP = 25          # 每 25 帧标注一次
 NUM_PIGS = 4
 G_ALL_PARTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20]
+IMG_W, IMG_H = 1920, 1080
+# 假数据的内参：无畸变，便于闭环自检时得到 ~0 重投影误差
+MOCK_K = np.array([[1200.0, 0.0, 960.0],
+                   [0.0, 1200.0, 540.0],
+                   [0.0, 0.0, 1.0]])
+MOCK_COEFF = np.zeros(5)
+# 官方 BamaPig3D 的真实内参（undistortion.py 给出；label_images 已去畸变，
+# 所以标签对应的是 getOptimalNewCameraMatrix(alpha=1) 之后的 newcameramtx）
+REAL_K = np.array([[1625.30923, 0.0, 963.88710],
+                   [0.0, 1625.34802, 523.45901],
+                   [0.0, 0.0, 1.0]])
+REAL_COEFF = np.array([-0.35582, 0.14595, -0.00031, -0.00004, 0.00000])
 
 
 def make_pig_pose_19(phase: float, body_len: float, leg_len: float, height: float,
@@ -96,8 +114,7 @@ def main():
         from scipy.spatial.transform import Rotation
         np.savetxt(os.path.join(args.out, "extrinsic_camera_params", f"{cid:02d}.txt"),
                    np.concatenate([Rotation.from_matrix(R).as_rotvec(), t]))
-    with open(os.path.join(args.out, "camids.txt"), "w") as f:
-        f.write("\n".join(str(c) for c in cams))
+    # 与官方一致：不写 camids.txt（相机序号由文件名的两位数字体现）
 
     # ---- 生成 3D 姿态：(70, 4, 19, 3) ----
     poses19 = np.zeros((NUM_FRAMES, NUM_PIGS, 19, 3))
@@ -113,23 +130,38 @@ def main():
                 y_off=(pid - 1.5) * 0.8)
 
     # ---- 写 label_3d/*.txt（23 行版，4 行为 0）----
-    zero_rows = [r for r in range(23) if r not in G_ALL_PARTS]
     for k in range(NUM_FRAMES):
         fid = k * FRAME_STEP
         for pid in range(NUM_PIGS):
             full = np.zeros((23, 3))
             full[G_ALL_PARTS] = poses19[k, pid]
-            # 模拟遮挡：随机若干关节置 0（官方未标注的关节也是 0）
+            # label_3d 模拟遮挡：随机若干关节置 0（官方未标注的关节也是 0）
             for j in rng.choice(19, size=rng.integers(0, 3), replace=False):
                 full[G_ALL_PARTS[j]] = 0.0
             np.savetxt(os.path.join(args.out, "label_3d",
                                     f"pig_{pid}_frame_{fid:06d}.txt"), full)
 
-    # ---- label_3d.pkl（官方精简版同构）----
-    with open(os.path.join(args.out, "label_3d.pkl"), "wb") as f:
-        pickle.dump(poses19.copy(), f)
+    # ---- 23 关节版 pkl：与官方 label_3d.pkl / label_mix.pkl / label_mesh.pkl 同构 ----
+    # 官方这三个都是 (70,4,23,3)，其中 4 个非关节行恒为 0。
+    # label_mix / label_mesh 用 mesh 补齐了缺失关节 -> 19 个关节全部有效；
+    # label_3d 保留原始缺失（约 40% 的关节为 0）。这里按同样口径生成，
+    # 以便真正走通"23 -> g_all_parts -> 19"的代码路径。
+    def to_23(clean: bool, drop_prob: float):
+        out = np.zeros((NUM_FRAMES, NUM_PIGS, 23, 3))
+        out[..., G_ALL_PARTS, :] = poses19
+        if clean:
+            return out
+        mask = rng.random((NUM_FRAMES, NUM_PIGS, 19)) < drop_prob
+        out[..., G_ALL_PARTS, :][mask] = 0.0
+        return out
+
     with open(os.path.join(args.out, "label_mix.pkl"), "wb") as f:
-        pickle.dump(poses19.copy(), f)
+        pickle.dump(to_23(clean=True, drop_prob=0.0), f)
+    with open(os.path.join(args.out, "label_mesh.pkl"), "wb") as f:
+        pickle.dump(to_23(clean=True, drop_prob=0.0), f)
+    with open(os.path.join(args.out, "label_3d.pkl"), "wb") as f:
+        pickle.dump(to_23(clean=False, drop_prob=0.32), f)
+    # 官方该目录没有 camids.txt，相机顺序由文件名推断（也无需此文件），这里同样不生成。
 
     # ---- label_keypoints2d.pkl：(70, 10, 4, 19, 3) ----
     kp2d = np.zeros((NUM_FRAMES, len(cams), NUM_PIGS, 19, 3), np.float64)
@@ -140,7 +172,8 @@ def main():
                 X = poses19[k, pid]
                 xc = (R @ X.T).T + t                     # 相机系
                 xc[:, 2] = np.where(np.abs(xc[:, 2]) < 1e-6, 1e-6, xc[:, 2])
-                uv = xc[:, :2] / xc[:, 2:3] * 1200.0 + np.array([960.0, 540.0])
+                xc_n = xc[:, :2] / xc[:, 2:3]            # 归一化图像坐标
+                uv = xc_n * np.array([MOCK_K[0, 0], MOCK_K[1, 1]]) + MOCK_K[:2, 2]
                 kp2d[k, i, pid, :, :2] = uv
                 kp2d[k, i, pid, :, 2] = 1.0              # valid 标记
     # 模拟检测失败：随机把少数点标为无效
@@ -149,8 +182,21 @@ def main():
     with open(os.path.join(args.out, "label_keypoints2d.pkl"), "wb") as f:
         pickle.dump(kp2d, f)
 
+    # ---- intrinsic_camera_params/distortion_info.pkl（官方同构）----
+    # 官方该文件至少含 "newcameramtx"（去畸变后的相机矩阵），check_mammal_data.py 会读它
+    os.makedirs(os.path.join(args.out, "intrinsic_camera_params"), exist_ok=True)
+    with open(os.path.join(args.out, "intrinsic_camera_params", "distortion_info.pkl"),
+              "wb") as f:
+        pickle.dump({"newcameramtx": MOCK_K, "K": REAL_K, "coeff": REAL_COEFF,
+                     "roi": (0, 0, IMG_W, IMG_H), "w": IMG_W, "h": IMG_H}, f)
+
     print(f"[ok] 假数据已生成 -> {args.out}")
-    print(f"     3D 姿态 {poses19.shape}，2D 标注 {kp2d.shape}，{len(cams)} 个视角 {cams}")
+    print(f"     3D 姿态 {poses19.shape}；pkl 写成官方的 23 关节版 "
+          f"(70,4,23,3)，其中 label_mix/label_mesh 全 19 关节有效、"
+          f"label_3d 有缺失")
+    print(f"     2D 标注 {kp2d.shape}，{len(cams)} 个视角 {cams}")
+    print(f"     内参 newcameramtx fx={MOCK_K[0,0]:.1f} fy={MOCK_K[1,1]:.1f} "
+          f"cx={MOCK_K[0,2]:.1f} cy={MOCK_K[1,2]:.1f}（无畸变）")
     print(f"     ⚠️ 仅用于验证代码链路（骨架为程序化生成），不可用于任何精度结论")
 
 

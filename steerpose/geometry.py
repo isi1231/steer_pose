@@ -2,9 +2,12 @@
 """几何工具：视角合成、Rodrigues 旋转、投影、度量指标（论文附录 D.1）.
 
 训练数据生成流程:
-  1. Fibonacci 球面法在上半单位球面均匀取 100 个视点（朝向原点）；
-  2. 每个视点绕光轴均匀采 20 个滚转角；
-  3. 随机抽 num_pairs 对相机，对 3D 姿态做正交投影 -> (P, P') 与真值相对旋转 R。
+  1. Fibonacci 球面法**在完整单位球面上**均匀取 100 个视点（朝向原点），再对每个视点
+     绕光轴均匀采 20 个滚转角，共 2000 台相机；
+  2. 随机抽 num_pairs 对相机，对 3D 姿态做正交投影 -> (P, P') 与真值相对旋转 R。
+
+⚠️ 视点必须覆盖**完整球面**而不是只取上半球：只取上半球等价于只覆盖一半旋转群，
+   训练集里不存在"镜像视图"，推理时会静默失效（见 make_two_view_scene 的说明）。
 """
 import math
 import numpy as np
@@ -12,8 +15,29 @@ import torch
 from scipy.spatial.transform import Rotation
 
 
+def fibonacci_sphere(n: int = 100) -> np.ndarray:
+    """单位球面（含下半球）均匀取 n 个视点 (n, 3)，用于覆盖完整的 SO(3)。
+
+    ⚠️ 早期实现只取上半球（z>=0.05），这会让训练相机集合缺失一半朝向。
+    后果很隐蔽：网络只见过"相机 z 轴落在位姿系上半球"的视图，遇到镜像视图
+    （等价于从下半球看）时会输出完全错误的结果。详见 make_two_view_scene 的说明。
+    """
+    pts = []
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(n):
+        z = 1.0 - 2.0 * (i + 0.5) / n          # [-1, 1]，含负值
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        phi = i * golden
+        pts.append([r * math.cos(phi), r * math.sin(phi), z])
+    return np.asarray(pts, dtype=np.float64)
+
+
 def fibonacci_hemisphere(n: int = 100) -> np.ndarray:
-    """上半单位球面均匀取 n 个视点 (n, 3)。"""
+    """上半单位球面均匀取 n 个视点 (n, 3)。
+
+    保留是为了向后兼容；训练默认已改用 fibonacci_sphere（见 ViewSynthesizer）。
+    只用上半球等价于只覆盖一半旋转群，会引入"镜像视图"这一分布外输入。
+    """
     pts = []
     golden = math.pi * (3.0 - math.sqrt(5.0))
     for i in range(n):
@@ -60,31 +84,73 @@ def perspective_project(pose3d: np.ndarray, R: np.ndarray, t: np.ndarray,
 
 def make_two_view_scene(n_obj: int = 12, seed: int = 0, jitter: float = 0.35,
                         rot_deg: float = None, baseline: float = None,
-                        xy: float = 1.2, depth=(3.0, 6.0)) -> dict:
+                        xy: float = 1.2, depth=(3.0, 6.0),
+                        camera_a: str = "training") -> dict:
     """合成"两视角 + 已知真值相对位姿"的场景，用于几何自检与 calibrate --demo。
 
-    相机 A 固定在原点（R=I, t=0）；相机 B 用随机朝向与基线。目标在视锥内随机摆放，
-    这样 t 才可辨识（所有目标都挤在一条视线上时 t 是退化的）。
+    返回 dict: P, P2, R, t, poses3d, camera_a（P/P2 为**归一化图像坐标**，可直接喂 calibrate）
 
-    返回 dict: P, P2, R, t, poses3d（P/P2 为**归一化图像坐标**，可直接喂 calibrate）
+    ⚠️ 为什么相机 A 不能随便放（曾经踩过的坑，别改回去也别误判）
+    ----------------------------------------------------------------
+    1. 对**标定问题本身**，相机 A 的朝向只是世界系的规范选择：整体旋转同时作用于姿态与
+       两台相机时，P、P'、(R, t) 全都不变。所以相机 A 放哪里都不影响 ER/Et 的定义。
+    2. 但 P 是**网络的输入**，它的 2D 形状（含手性）取决于相机 A 相对"姿态规范系"的朝向。
+       论文附录 D.1 把 100 台相机放在**单位半球面**上（原文："100 cameras uniformly over
+       the unit hemisphere"），即网络只见过"从一侧看"的 2D 形状；镜像视角（正交投影下
+       等价于从另一侧看）它没见过。实测：把相机 A 放在 `np.eye(3)`（沿世界 +z 看）时，
+       同一权重的 Lkp 由 0.23 跳到 0.60、12 个目标 **0 个**被正确匹配 → Lmatch 降不下来
+       → Sinkhorn 近均匀指派 → 可靠匹配不足 3 对 → **Lgeom 恒为 0**。
+       症状全在推理端，训练曲线完全看不出来。
+    3. 因此默认 `camera_a="training"`：相机 A 取自训练同源的相机集合（用上半球那批，
+       它是 sphere / hemisphere 两种训练配置的公共区域，对两者都在分布内）。
+       `camera_a="identity"` 保留旧行为，仅用于复现"分布外输入"这一现象；
+       也可以直接传一个 (3,3) 旋转矩阵。
+    4. 相机 B 随便放不影响网络输入（它只决定真值 R、t 与目标 P2），但必须保证**物体在
+       B 的前方**，否则透视投影的深度变号、场景物理上不成立。这里按"物体到 B 的距离
+       ~ depth"反解 B 的位置，天然满足。
+
+    目标在视锥内随机摆放，这样 t 才可辨识（所有目标都挤在一条视线上时 t 是退化的）。
     """
     rng = np.random.default_rng(seed)
     base = make_demo_dataset(num_anims=n_obj, num_frames=1, seed=seed)
     base = base - base.mean(axis=1, keepdims=True)
     base = base / (np.abs(base).max() + 1e-9) * jitter
-    pos = rng.uniform([-xy, -xy, depth[0]], [xy, xy, depth[1]], size=(n_obj, 1, 3))
-    posed3d = base + pos
 
+    # ---- 相机 A ----
+    if camera_a == "training":
+        # 上半球相机集合：sphere / hemisphere 两种训练配置的公共区域
+        cams = ViewSynthesizer(num_views=100, num_rolls=20, num_pairs=1,
+                               seed=seed, full_sphere=False).cameras
+        Ra = cams[int(rng.integers(len(cams)))]
+    elif camera_a == "identity":
+        Ra = np.eye(3)
+    else:
+        Ra = np.asarray(camera_a, np.float64)
+        if Ra.shape != (3, 3):
+            raise ValueError(f"camera_a 应为 'training' / 'identity' 或 (3,3) 旋转矩阵，收到 {Ra.shape}")
+
+    # ---- 目标摆放：在**相机 A 系**里摆（相机 A 在原点、沿 +z 看），保证都在视锥内 ----
+    pos_a = rng.uniform([-xy, -xy, depth[0]], [xy, xy, depth[1]], size=(n_obj, 1, 3))
+    posed3d_a = base + pos_a
+    posed3d_w = posed3d_a @ Ra          # 世界系坐标：X_a = Ra @ X_w
+
+    # ---- 相机 B：相对旋转 R，相对平移 t（由"物体在 B 前方"反解）----
     axis = rng.normal(size=3); axis /= np.linalg.norm(axis)
     deg = rot_deg if rot_deg is not None else rng.uniform(20.0, 90.0)
     R = Rotation.from_rotvec(axis * np.deg2rad(deg)).as_matrix()
-    t = rng.normal(size=3); t = t / np.linalg.norm(t) * \
-        (baseline if baseline is not None else rng.uniform(0.8, 2.5))
+    fwd_b = R[2]                                  # 相机 B 光轴（在 A 系中）方向
+    d0 = float(posed3d_a[..., 2].mean())          # 物体中心到相机 A 的距离
+    d_b = float(rng.uniform(*depth))              # 物体到相机 B 的距离
+    lat = rng.normal(size=3); lat -= float(lat @ fwd_b) * fwd_b
+    lat /= np.linalg.norm(lat) + 1e-12
+    b = baseline if baseline is not None else rng.uniform(0.8, 2.5)
+    c_b = np.array([0.0, 0.0, d0]) - fwd_b * d_b + lat * b   # 相机 B 中心（A 系）
+    t = -R @ c_b                                  # X_b = R X_a + t
 
-    P = perspective_project(posed3d, np.eye(3), np.zeros(3))
-    P2 = perspective_project(posed3d, R, t)
-    return {"P": P, "P2": P2, "R": R, "t": t, "poses3d": posed3d,
-            "focal": 1.0, "principal_point": np.zeros(2)}
+    P = perspective_project(posed3d_w, Ra, np.zeros(3))
+    P2 = perspective_project(posed3d_w, R @ Ra, t)
+    return {"P": P, "P2": P2, "R": R, "t": t, "poses3d": posed3d_w,
+            "camera_a": Ra, "focal": 1.0, "principal_point": np.zeros(2)}
 
 
 # ---------------- Rodrigues 旋转（可微 / numpy 两版） ----------------
@@ -124,10 +190,19 @@ def translation_error_deg(t_est: np.ndarray, t_gt: np.ndarray) -> float:
 
 class ViewSynthesizer:
     def __init__(self, num_views: int = 100, num_rolls: int = 20,
-                 num_pairs: int = 3000, seed: int = 0):
+                 num_pairs: int = 3000, seed: int = 0, full_sphere: bool = True):
+        """full_sphere=True 用完整球面覆盖 SO(3)（推荐）。
+
+        只用上半球（full_sphere=False）时，相机 z 轴恒落在位姿系的上半球，
+        等价于只覆盖一半旋转群：训练集里不存在"镜像视图"。标定时若真实相机
+        相对位姿系的朝向落在下半球，2D 形状就是镜像的，网络会给出完全错误的
+        预测（实测 Lkp 0.23 -> 0.60，正确配对无一被挑出）。所以默认用完整球面。
+        """
         self.rng = np.random.default_rng(seed)
         self.cameras = []
-        for e in fibonacci_hemisphere(num_views):
+        directions = fibonacci_sphere(num_views) if full_sphere \
+            else fibonacci_hemisphere(num_views)
+        for e in directions:
             R0 = look_at_origin(e)
             for k in range(num_rolls):
                 self.cameras.append(roll_about_axis(R0, 2.0 * math.pi * k / num_rolls))

@@ -10,9 +10,10 @@ venv/
 ckpt/
 out/
 logs/
+log/
 *.pt
 *.pth
-*_train.log
+*.log
 *_config.json
 
 # --- 数据（大文件不入库）---

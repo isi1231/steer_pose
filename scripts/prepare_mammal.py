@@ -169,8 +169,12 @@ def main():
                         source=np.array([f"MAMMAL/BamaPig3D:{src_desc}"]))
     print(f"[ok] 已保存 -> {args.out} ({os.path.getsize(args.out)/1e6:.2f} MB, "
           f"{poses.shape[0]} 个姿态)")
-    print(f"     训练: python -m steerpose.train --poses3d {args.out} "
-          f"--epochs 200 --batch 1024 --workers 8 --device cuda --out ckpt/bamapig.pt")
+    print(f"     训练: bash scripts/run_h100.sh {args.out} quick"
+          f"   # 按目标总步数自动折算 epoch")
+    print(f"     或手动: python -m steerpose.train --poses3d {args.out} "
+          f"--epochs 2000 --batch 256 --workers 8 --device cuda --out ckpt/bamapig.pt")
+    print(f"     ⚠️ 决定成败的是**总优化步数**（每轮批数 × epoch），不是 epoch 数；"
+          f"训练日志会打印总步数与平凡基线")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""推理链自检：匹配矩阵 M1 + 几何一致性 Lgeom M2（不依赖训练，秒级完成）。
+"""推理链自检：匹配矩阵 M1 + 几何一致性 Lgeom M2 + 内参 K 通路 M3
+（不依赖训练，秒级完成）。
 
 为什么需要这个自检
 ------------------
@@ -14,6 +15,8 @@ SteerPose 的**推断阶段**（calibrate）几乎全部的正确性都藏在两
   M2 几何：Lgeom(R_gt) 必须显著小于 Lgeom(R_wrong)
            用 R_gt + 正确匹配解出的 t 方向必须接近 t_gt
            对 R 求导不能出现 NaN
+  M3 内参：像素坐标 -> 按 K 归一化 -> 几何求解，必须与归一化坐标下等价
+           （覆盖 prepare_mammal_2d 写进 npz 的 'K' 到 calibrate 的整条链路）
 
 历史教训（本仓库曾踩过，故留此自检）
 ------------------------------------
@@ -28,6 +31,9 @@ SteerPose 的**推断阶段**（calibrate）几乎全部的正确性都藏在两
     方向正好相反，会把 R 往错误方向推。
   * 几何约束曾使用"按包围盒缩放"的归一化坐标。缩放会改变每条射线的方向，
     正确的 R 不再对应零奇异值 —— 必须用按**焦距**归一化的图像坐标。
+  * 内参缺失时曾用 0.9×图像尺寸瞎猜焦距。BamaPig3D 的 label_images 已去畸变，
+    正确口径是 newcameramtx（fx≈1340，而不是原始 K 的 1625，也不是 0.9×1920）。
+    焦距/主点错了不会报错，只是 R 的解变差 —— 所以单列 M3 检查。
 
 用法:
     python scripts/selftest_infer.py
@@ -44,7 +50,8 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from steerpose.geometry import (make_two_view_scene, matrix_to_rodrigues,  # noqa: E402
-                                rodrigues_to_matrix, rotation_error_deg)
+                                rodrigues_to_matrix, rotation_error_deg,
+                                translation_error_deg)
 from steerpose.losses import (geometric_loss, matching_loss, pose_distance,  # noqa: E402
                               pose_distance_ref, solve_translation, to_ray_coords)
 
@@ -122,6 +129,16 @@ def main():
     if args.noise > 0:
         P = P + rng.normal(0, args.noise, P.shape)
         P2 = P2 + rng.normal(0, args.noise, P2.shape)
+
+    # --- 场景物理合法性：物体必须同时落在两台相机的前方（深度 > 0）---
+    # 深度变号会让透视投影在物体内部"翻面"，几何约束不再是同一个物理场景。
+    Xa = sc["poses3d"] @ sc["camera_a"].T                 # 世界系 -> 相机 A 系
+    Xb = (sc["poses3d"] @ (sc["R"] @ sc["camera_a"]).T) + sc["t"]
+    dza, dzb = Xa[..., 2].min(), Xb[..., 2].min()
+    print(f"[场景] 深度范围：相机 A {dza:.2f}~{Xa[...,2].max():.2f}，"
+          f"相机 B {dzb:.2f}~{Xb[...,2].max():.2f}")
+    checks.append((f"场景物理合法（两台相机前方深度均 > 0，A {dza:.2f} / B {dzb:.2f}）",
+                   dza > 0 and dzb > 0))
 
     # 合成场景已知内参（f=1, 主点=0），直接给它 -> 几何是精确的
     rc = dict(focal=sc["focal"], principal_point=sc["principal_point"])
@@ -206,6 +223,40 @@ def main():
     err_warm = rotation_error_deg(rodrigues_to_matrix(rv_warm).detach().numpy(), R_gt)
     print(f"[opt] 仅用 Lgeom：45° 冷启动 -> ER = {err_cold:6.2f}°（非判定项，非凸目标存在局部极小）")
     print(f"[opt] 仅用 Lgeom：真值 +5° 起步 -> ER = {err_warm:6.2f}°（预期的收尾场景）")
+
+    # ================= M3：内参 K 通路（BamaPig3D 用 newcameramtx） =================
+    # 合成场景给的是归一化坐标（f=1，主点=0）。把它换算成"某台真实相机"的像素坐标，
+    # 再只用 K 走一遍 to_ray_coords + 几何求解：
+    #   - 若 K 通路正确，换算回去应与原始归一化坐标一致（往返闭合）；
+    #   - 平移方向误差应仍然极小（说明焦距/主点都进了正确的量）。
+    # 这一步专门覆盖 prepare_mammal_2d -> calibrate 传 K 的那条新链路。
+    print("========== M3 内参 K 通路 ==========")
+    KK = np.array([[1200.0, 0.0, 960.0],
+                   [0.0, 1215.0, 540.0],
+                   [0.0, 0.0, 1.0]])          # fx != fy，故意用非方形像素
+    P_px = P * np.array([KK[0, 0], KK[1, 1]]) + KK[:2, 2]
+    P2_px = P2 * np.array([KK[0, 0], KK[1, 1]]) + KK[:2, 2]
+    Pg_k = to_ray_coords(P_px, K=KK)
+    roundtrip = float(np.abs(Pg_k - P).max())
+    PgK = torch.from_numpy(Pg_k).float()
+    P2gK = torch.from_numpy(to_ray_coords(P2_px, K=KK)).float()
+    t_k = solve_translation(PgK, P2gK, pairs, R_t, reduce=args.reduce)
+    t_err_k = translation_error_deg(t_k, t_gt)
+    lg_true_k = float(geometric_loss(PgK, P2gK, W, R_t, reduce=args.reduce))
+    stats_k = {}
+    _ = geometric_loss(PgK, P2gK, W, R_t, reduce=args.reduce, stats=stats_k)
+    print(f"[K] 像素坐标 -> 归一化坐标往返最大偏差 {roundtrip:.2e}")
+    print(f"[K] 只用 K 做几何：平移方向误差 {t_err_k:.2f}°  Lgeom(R_gt) {lg_true_k:.2e}")
+    print(f"[K] 诊断字段：n_pairs={stats_k.get('n_pairs')} active={stats_k.get('active')}")
+    checks += [
+        ("to_ray_coords(K=...) 与 (focal, principal_point) 口径等价（往返 < 1e-9）",
+         roundtrip < 1e-9),
+        ("只用内参 K 时平移方向依然可解（误差 < 5°）", t_err_k < 5.0),
+        ("只用内参 K 时 Lgeom(R_gt) 仍接近 0（< 1e-3）", lg_true_k < 1e-3),
+        ("geometric_loss 能报告匹配对数与是否生效", stats_k.get("n_pairs") == K
+         and bool(stats_k.get("active"))),
+    ]
+    print()
 
     checks += [
         ("Lgeom(R_gt) < 0.2 x Lgeom(随机) —— 损失方向正确、有判别力",

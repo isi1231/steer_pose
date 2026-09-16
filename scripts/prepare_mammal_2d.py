@@ -6,29 +6,39 @@
   - label_keypoints2d.pkl : (70, 10, 4, 19, 3)
         轴含义 [帧, 相机序号, 个体, 关节, (x, y, valid)]
         相机序号对应官方 camids = [0,1,2,5,6,7,8,9,10,11]
-        x/y 为像素坐标（未去畸变时需先用官方 undistortion.py 处理）
-  - label_3d.pkl / label_mix.pkl : (70, 4, 19, 3)  3D 关键点（本脚本用来判断姿态质量）
+        x/y 是**已去畸变图像**(label_images)上的像素坐标
+  - label_3d.pkl / label_mix.pkl : (70, 4, 19, 3) 或 (70, 4, 23, 3)
   - extrinsic_camera_params/{camid:02d}.txt : 6 个浮点数
         前 3 个为相机旋转（axis-angle），后 3 个为平移 xyz，单位米
-        约定 x_cam = R @ X_world + t（与官方 README 一致）
+        约定 x_cam = R @ X_world + t（与官方 visualize_BamaPig3D.py 一致）
+  - intrinsic_camera_params/distortion_info.pkl : 内含 newcameramtx
+        ★ label_images 已经去畸变，所以标签对应的相机矩阵是 newcameramtx，
+          不是 undistortion.py 里那个带畸变的原始 K。本脚本自动读取。
 
 输出 npz（直接喂给 steerpose.calibrate）：
-    P    : (B1, 19, 2)  视角 A 的 2D 姿态集合
-    P2   : (B2, 19, 2)  视角 B 的 2D 姿态集合
+    P    : (B1, 19, 2)  视角 A 的 2D 姿态（像素坐标）
+    P2   : (B2, 19, 2)  视角 B 的 2D 姿态（像素坐标）
     R    : (3, 3)       真值相对旋转（A -> B，满足 R = R_b @ R_a^T）
     t    : (3,)         真值相对平移（仅方向有意义）
+    K    : (3, 3)       内参（newcameramtx）—— calibrate 会直接用它，
+                        等价于给 --focal fx 与主点 (cx, cy)
     meta_* : 帧号 / 个体 / 相机 ID，便于溯源
 
 用法:
     # 论文 Table 7：标定用帧 1400-1750，取相机 0 与 6
-    python scripts/prepare_mammal_2d.py \\
-        --kp2d /data/BamaPig3D_pure_pickle/label_keypoints2d.pkl \\
-        --extrinsics /data/BamaPig3D/extrinsic_camera_params \\
+    python scripts/prepare_mammal_2d.py --root /data/BamaPig3D_pure_pickle \\
         --cam-a 0 --cam-b 6 --min-frame 1400 \\
         --out data/two_view_pig_c0_c6.npz
 
+    # 也可以分别指定文件
+    python scripts/prepare_mammal_2d.py \\
+        --kp2d /data/BamaPig3D_pure_pickle/label_keypoints2d.pkl \\
+        --extrinsics /data/BamaPig3D/extrinsic_camera_params \\
+        --cam-a 0 --cam-b 6 --min-frame 1400 --out data/two_view_pig_c0_c6.npz
+
     # 模拟论文"GT 2D + 高斯噪声 σ=3px"的设置
-    python scripts/prepare_mammal_2d.py ... --noise-px 3 --seed 0 --out data/two_view_noisy.npz
+    python scripts/prepare_mammal_2d.py --root ... --noise-px 3 --seed 0 \\
+        --out data/two_view_noisy.npz
 
 随后标定:
     python -m steerpose.calibrate --ckpt ckpt/bamapig_best.pt \\
@@ -43,6 +53,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from check_mammal_data import load_intrinsics  # noqa: E402  （同目录下的复用）
 
 CAMIDS = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11]   # 官方 10 个视角的顺序
 NUM_JOINTS = 19
@@ -104,8 +116,11 @@ def extract_view(kp: np.ndarray, cam_idx: int, frame_idx: int, min_valid: int):
 
 def main():
     ap = argparse.ArgumentParser(description="BamaPig3D 两视角标定数据准备")
-    ap.add_argument("--kp2d", type=str, required=True, help="label_keypoints2d.pkl 路径")
-    ap.add_argument("--extrinsics", type=str, required=True,
+    ap.add_argument("--root", type=str, default=None,
+                    help="BamaPig3D_pure_pickle 目录（自动找 label_keypoints2d.pkl / "
+                         "extrinsic_camera_params / intrinsic_camera_params）")
+    ap.add_argument("--kp2d", type=str, default=None, help="label_keypoints2d.pkl 路径")
+    ap.add_argument("--extrinsics", type=str, default=None,
                     help="extrinsic_camera_params 目录")
     ap.add_argument("--cam-a", type=int, default=0, help="视角 A 的相机 ID")
     ap.add_argument("--cam-b", type=int, default=6, help="视角 B 的相机 ID")
@@ -121,7 +136,19 @@ def main():
     ap.add_argument("--out", type=str, default="data/two_view_bamapig.npz")
     args = ap.parse_args()
 
-    kp = load_kp2d(args.kp2d)
+    # ---- 定位输入文件 ----
+    kp2d_path, extr_dir = args.kp2d, args.extrinsics
+    if args.root:
+        kp2d_path = kp2d_path or os.path.join(args.root, "label_keypoints2d.pkl")
+        extr_dir = extr_dir or os.path.join(args.root, "extrinsic_camera_params")
+    if not kp2d_path or not os.path.isfile(kp2d_path):
+        raise SystemExit(f"[!] 找不到 label_keypoints2d.pkl：{kp2d_path}\n"
+                         f"    请给 --root <BamaPig3D_pure_pickle 目录> 或 --kp2d <文件>")
+    if not extr_dir or not os.path.isdir(extr_dir):
+        raise SystemExit(f"[!] 找不到 extrinsic_camera_params 目录：{extr_dir}\n"
+                         f"    请给 --root 或 --extrinsics")
+
+    kp = load_kp2d(kp2d_path)
     F = kp.shape[0]
     # 帧号映射：官方每 25 帧标注一次（第 k 个标注帧 = 25k）
     frame_ids = np.arange(F) * 25
@@ -138,12 +165,22 @@ def main():
 
     cams = CAMIDS
     ia, ib = cams.index(args.cam_a), cams.index(args.cam_b)
-    extr = load_extrinsics(args.extrinsics, [args.cam_a, args.cam_b])
+    extr = load_extrinsics(extr_dir, [args.cam_a, args.cam_b])
     Ra, ta = extr[args.cam_a]
     Rb, tb = extr[args.cam_b]
     R_rel = Rb @ Ra.T                       # 世界->相机约定下的 A->B 相对旋转
     t_rel = tb - R_rel @ ta                 # 对应的相对平移（方向有意义）
     print(f"[i] 相机 {args.cam_a} 与 {args.cam_b} 的真值相对旋转已由外参算出")
+
+    # ---- 内参：label_images 已去畸变 -> 用 newcameramtx ----
+    K = None
+    if args.root:
+        K, ksrc, _ = load_intrinsics(args.root, verbose=False)
+        print(f"[i] 内参（{ksrc}）fx={K[0,0]:.2f} fy={K[1,1]:.2f} "
+              f"cx={K[0,2]:.2f} cy={K[1,2]:.2f}")
+        print("     注意：label_images 已去畸变，标签对应的就是 newcameramtx，无需再处理畸变")
+    else:
+        print("[i] 未给 --root，未写入内参；calibrate 时请用 --focal 指定像素焦距")
 
     rng = np.random.default_rng(args.seed)
     Ps, P2s, metas = [], [], []
@@ -162,7 +199,8 @@ def main():
         pb = pb[[list(pigs_b).index(p) for p in common]]
         Ps.append(pa); P2s.append(pb)
         metas.append((frame_ids[f], common))
-        print(f"    帧 {int(frame_ids[f])}: {len(common)} 个共同个体 {common}")
+        if len(sel) <= 12:
+            print(f"    帧 {int(frame_ids[f])}: {len(common)} 个共同个体 {common}")
 
     if not Ps:
         raise RuntimeError("没有得到任何可用帧，请放宽 --min-valid-joints 或检查帧范围")
@@ -175,14 +213,20 @@ def main():
         print(f"[i] 已加高斯噪声 σ = {args.noise_px} px")
     print(f"[i] 视角 A {P.shape}，视角 B {P2.shape}（含 {len(Ps)} 帧）")
 
+    out_kw = {}
+    if K is not None:
+        out_kw["K"] = K.astype(np.float64)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez(args.out, P=P.astype(np.float32), P2=P2.astype(np.float32),
              R=R_rel.astype(np.float64), t=t_rel.astype(np.float64),
              frames=np.array([m[0] for m in metas], np.int32),
-             cam_a=args.cam_a, cam_b=args.cam_b)
-    print(f"[ok] 已保存 -> {args.out}")
+             cam_a=args.cam_a, cam_b=args.cam_b, **out_kw)
+    print(f"[ok] 已保存 -> {args.out}"
+          f"{'（含 K）' if K is not None else ''}")
     print(f"     标定: python -m steerpose.calibrate --ckpt ckpt/bamapig_best.pt "
           f"--poses-npz {args.out} --out out/two_view_c{args.cam_a}_c{args.cam_b}.npz")
+    print(f"     先跑数据体检: python scripts/check_mammal_data.py --root "
+          f"{args.root or '<pure_pickle 目录>'}")
 
 
 if __name__ == "__main__":

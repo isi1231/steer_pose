@@ -127,8 +127,12 @@ def main():
     np.savez_compressed(args.out, poses3d=poses.astype(np.float32),
                         source=np.array([src]))
     print(f"[ok] 已保存 -> {args.out}  ({os.path.getsize(args.out)/1e6:.2f} MB)")
-    print(f"     训练命令: python -m steerpose.train --poses3d {args.out} "
-          f"--epochs 300 --batch 512 --workers 4 --device cuda")
+    print(f"\n     训练命令（注意：决定成败的是**总优化步数** = 每轮批数 × epoch，")
+    print(f"     不是 epoch 数。这个模型只有 ~69K 参数，epoch 很便宜，先给足步数）：")
+    print(f"     python -m steerpose.train --poses3d {args.out} \\")
+    print(f"         --epochs 2000 --batch 256 --workers 4 --device cuda --out ckpt/run.pt")
+    print(f"     或直接用脚本按目标步数自动折算：")
+    print(f"     bash scripts/run_h100.sh {args.out} quick")
 
 
 if __name__ == "__main__":

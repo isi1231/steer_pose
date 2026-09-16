@@ -148,10 +148,20 @@
   这是论文本身就存在的设定混用，本复现保持一致，但意味着若场景有强透视（大 FOV / 近距目标），
   几何项与网络学到的成像模型会失配；
 - 多视角整合（motion averaging / cycle-consistent matching / BA）未实现；
+- **相机集合：默认用完整球面，而非论文的上半球**（*有意偏离*）。论文附录 D.1 原文是
+  "we placed 100 cameras uniformly over the unit hemisphere"，本复现实现为
+  `train.py --cameras sphere|hemisphere`，默认 `sphere`。
+  理由：网络输入 P 的 **2D 形状手性**取决于相机相对姿态规范系的朝向，半球训练只覆盖一侧；
+  真实相机的朝向是任意的，落在另一侧时模型会**静默**失效（匹配 0/N → Sinkhorn 近均匀 →
+  可靠匹配不足 3 对 → `Lgeom` 恒为 0，而训练曲线完全正常）。
+  要严格对齐论文请显式 `--cameras hemisphere`（此时 `calibrate --demo` 仍可用，因为演示
+  场景的相机 A 已改为"训练同源"取法）。A/B 脚本：`scripts/diag_sphere_fix.py`；
 - 官方实现用的 Sinkhorn 细节（迭代数、温度 τ、dummy 处理）论文未给，本复现取 τ=0.05、50 次迭代；
 - σ 的梯度用 PyTorch 自动微分（论文用闭式导数）。
 
-## 9. 实现修正记录（2026-09-16）
+## 9. 实现修正记录
+
+### 9.1 推断链三个隐蔽 bug（2026-09-16）
 
 一次代码审查中发现三个隐蔽 bug，**训练曲线全看不出来**（训练损失 `Lkp` 不经过匹配与几何路径）。
 发现手段是补上 `scripts/selftest_infer.py`（合成真值场景、秒级）。
@@ -165,4 +175,35 @@
 附带改进：`calibrate` 现在输出**匹配置信度**诊断（平均最大指派概率、可信匹配数），
 置信度 < 0.5 时明确警告"R 与 t 不可信"；`calibrate --demo` 改用透视投影的合成场景
 （原先用正交投影，与 Lgeom 的模型不自洽）；`make_demo_dataset` 对非法关节数改为显式报错。
+
+### 9.2 相机坐标系 / 分布外输入（2026-09-16 第二批）
+
+`calibrate --demo` 的 `Lgeom` 恒为 0、匹配全错。排查（脚本见 `scripts/diag_*.py`）依次排除了
+"演示数据太扁"、"正交 vs 透视不匹配"、"训练不足所以没用 R"、"批内是否共用相机对"，
+最终定位到**相机 A 的绝对朝向**：相机 A=I 时 Lkp 0.6029（匹配 0/12），
+换成训练相机集合里的相机后 0.1674（全对）。
+
+关键认知（写代码时最容易想反的一条）：
+- 相对位姿 `(R, t)` 对世界系的选取是**规范不变**的 → 相机 A 放哪里不影响标定问题的解；
+- 但网络输入 `P` 的 2D 形状**不是**规范不变的，它取决于相机相对姿态规范系的朝向。
+  所以"换个世界坐标系"和"换一台物理相机"是两件事，只有后者会改变网络输入。
+
+修正：`make_two_view_scene` 的相机 A 默认取自训练同源相机集合（`camera_a="training"`，
+`"identity"` 保留用于复现该现象）；相机 B 的位置改为按"物体在 B 前方"反解，
+避免旧代码随机生成 t 时出现深度变号（`selftest_infer.py` 新增"场景物理合法性"检查项）。
+
+### 9.2 内参口径 / 静默失效 / 最佳权重（2026-09-16 第二批）
+
+| # | 位置 | 问题 | 后果 | 修正 |
+|---|------|------|------|------|
+| 4 | `calibrate` + `prepare_mammal_2d` | 内参没贯通：前者只认 `--focal`，后者算出的 `newcameramtx` 没被使用 | BamaPig3D 的 `label_images` 已去畸变，用原始 K（1625）或猜测的 0.9×长边（1728）都会改变射线方向，`Lgeom` 判别力下降、R 变差，**且不报错** | `to_ray_coords` 支持 `K`；`prepare_mammal_2d` 把 `newcameramtx` 写进 npz 的 `K`；`calibrate` 按 `--K-file` > npz `K` > `--focal` 取用并打印实际内参 |
+| 5 | `losses.geometric_loss` | 匹配不足 3 对时静默返回 0 | `Lgeom 0.000` 分不清"正常工作"与"从未参与"，模型没训好时 R 实际只由 `Lmatch` 决定 | 新增 `confident_pairs()` 与 `stats` 诊断；日志打印实际使用的匹配对数并标注失效；多重启选优时优先选几何项生效的那次 |
+| 6 | `train.py` | 最佳权重保存条件写在独立的 `% log_every` 分支里，且每个记录点评估两次 | `--epochs` 不是 `log_every` 整数倍时 `_best.pt` 永不生成（如 `--epochs 5`），末尾打印 `best val Lkp inf`；验证开销翻倍 | 合并为一次评估、末轮强制评估并更新 `best`、跑完兜底；结束语同时给出最后权重与最佳权重路径 |
+
+**内参细节**（`undistortion.py` 与 `visualize_BamaPig3D.py` 推出）：原始
+`K = [[1625.31,0,963.89],[0,1625.35,523.46],[0,0,1]]`，`coeff = [-0.35582,0.14595,-0.00031,-0.00004,0]`；
+官方 `label_images` 是去畸变图，故标签对应
+`cv2.getOptimalNewCameraMatrix(K, coeff, (1920,1080), alpha=1)` = `fx≈1340.43, fy≈1342.80,
+cx≈964.89, cy≈521.54`。这与官方重投影示例
+`points2d = (points3d @ R.T + T) @ K.T` 用 `distortion_info.pkl` 里的 `newcameramtx` 完全一致。
 
