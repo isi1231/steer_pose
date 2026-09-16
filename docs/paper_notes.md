@@ -115,9 +115,54 @@
 
 ## 8. 本复现与论文的差异（已知）
 
+**论文原文对 Lgeom 的表述（已核实，用于对齐）**：
+> "Since the partial derivatives of the singular values **σ₂ ≥ σ₁** can be computed in closed-form
+> [36, 29], we include the **ratio σ₁/σ₂** as a loss Lgeom in the optimization of R, to guarantee
+> that the estimated R makes the **smallest singular value as small as possible**, and hence it has
+> a solution of t. Consequently, we optimize **Lmatch + λ·Lgeom**."
+>
+> 以及："For all **N corresponding 2D pose pairs** under current rotation R, we transform their
+> positions into a **normalized coordinate system**. By stacking linear equations derived from
+> collinearity and coplanarity constraints [19]..."
+
+据此确定的三点实现口径：
+
+1. **σ₁ = 最小、σ₂ = 次小**，Lgeom 取二者之比 → 0 表示当前 R 下存在合法平移解。
+   注意 `torch.linalg.svdvals` 返回**降序**，取最小两个是 `s[-1]`、`s[-2]`。
+2. **N = 匹配的"姿态对"数**，每个姿态对一个 3D 点 —— 本复现取该姿态的**关节质心**
+   作为观测点（`reduce="centroid"`）。也可用 `reduce="joints"` 逐关节取点（约束更多、
+   矩阵更大），两者都通过自检，质心版更贴论文口径且更快。
+3. **"normalized coordinate system" = 归一化图像坐标**（按焦距归一化），视线方向为
+   `(u, v, 1)`。**不能**用按包围盒缩放的数据自适应坐标 —— 缩放等价于偷偷改焦距，
+   会改变每条射线的方向，使正确的 R 不再对应零奇异值（实测对比度从 ~700× 掉到 ~0.2×）。
+
+其余仍在的差异：
+
 - 论文未给 MLP 层数 / 头数 / FFN 维度 / SteerPose 训练超参（lr、epoch、batch）→ 本复现取常规默认值；
-- `Lgeom` 的线性系统按论文 3.2 节文字描述实现（射线共线 + 两视图共面 → SVD 最小奇异值），
-  与官方实现（可能沿用文献[19]的稀疏矩阵构造）可能存在细节差异；
-  **奇异值梯度用 PyTorch 自动微分**（论文用闭式导数）；
+- 共面（coplanarity）约束未用于 Lgeom：论文把共线 + 共面一起堆进线性系统，但共面项在
+  **绝对外参**表述下才有"只含 t"的行（文献[19]用它做线性初值求解）；SteerPose 的相对两视角
+  场景下共线项已足以让 σ_min 在 R 正确时塌到 0（实测对比度 ~700×），故本复现只用共线项。
+  若要严格对齐，需按 `reference/calib_from_moving_person/calib_linear.py` 的
+  `collinearity_w2c` / `coplanarity_w2c` 一并构造；
+- 训练数据合成用**正交投影**（论文附录 D.1），而 Lgeom 是**透视**共线约束（文献[19]）——
+  这是论文本身就存在的设定混用，本复现保持一致，但意味着若场景有强透视（大 FOV / 近距目标），
+  几何项与网络学到的成像模型会失配；
 - 多视角整合（motion averaging / cycle-consistent matching / BA）未实现；
-- 官方实现用的 Sinkhorn 细节（迭代数、温度 τ、dummy 处理）论文未给，本复现取 τ=0.05、50 次迭代。
+- 官方实现用的 Sinkhorn 细节（迭代数、温度 τ、dummy 处理）论文未给，本复现取 τ=0.05、50 次迭代；
+- σ 的梯度用 PyTorch 自动微分（论文用闭式导数）。
+
+## 9. 实现修正记录（2026-09-16）
+
+一次代码审查中发现三个隐蔽 bug，**训练曲线全看不出来**（训练损失 `Lkp` 不经过匹配与几何路径）。
+发现手段是补上 `scripts/selftest_infer.py`（合成真值场景、秒级）。
+
+| # | 位置 | 问题 | 后果 | 修正 |
+|---|------|------|------|------|
+| 1 | `losses.pose_distance` | `torch.cdist(q, p).mean(-1)`：cdist 把 `(B,J,2)` 当**批量矩阵**沿 J 维广播，返回 `(B,J)` | 匹配矩阵 `W` 形状与语义全错（Sinkhorn 归一化维度也错了），几何项随后越界崩溃 | 广播作差 + 逐关节范数 → `(B1,B2)`；加 `pose_distance_ref` 交叉验证 |
+| 2 | `losses.geometric_loss` | 返回 `σ_2ndmin/σ_min`（方向反了） | 会把 R 推向**远离**真值的方向 | `s[-1]/(s[-2]+ε)` |
+| 3 | `losses.build_linear_system` | 行宽 `torch.zeros(3, 3+3)` 与 `torch.cat(rows, dim=1)` 自相矛盾；`Q[a]` 是整姿态 `(J,2)` 而非单点 | Lgeom 一旦激活（置信度 > 0.3）即 `RuntimeError`；训练早期 Lgeom 恒 0，**问题被掩盖** | 重写为 `A (3N, N+3)`，行方向 `cat(dim=0)` |
+
+附带改进：`calibrate` 现在输出**匹配置信度**诊断（平均最大指派概率、可信匹配数），
+置信度 < 0.5 时明确警告"R 与 t 不可信"；`calibrate --demo` 改用透视投影的合成场景
+（原先用正交投影，与 Lgeom 的模型不自洽）；`make_demo_dataset` 对非法关节数改为显式报错。
+

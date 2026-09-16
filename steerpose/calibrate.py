@@ -23,40 +23,48 @@ import numpy as np
 import torch
 
 from .data import normalize_pose
-from .geometry import (ViewSynthesizer, make_demo_dataset, matrix_to_rodrigues,
-                       ortho_project, rodrigues_to_matrix, rotation_error_deg)
-from .losses import build_linear_system, geometric_loss, matching_loss, similarity, pose_distance, to_cam_frame
+from .geometry import (make_two_view_scene, matrix_to_rodrigues,
+                       rodrigues_to_matrix, rotation_error_deg)
+from .losses import (geometric_loss, guess_focal, matching_loss,
+                     solve_translation, to_ray_coords)
 from .model import SteerPose
 
 
-def estimate_translation(Q: torch.Tensor, P2: torch.Tensor, W: torch.Tensor,
+def estimate_translation(Qg: torch.Tensor, P2g: torch.Tensor, W: torch.Tensor,
                          R: torch.Tensor) -> np.ndarray:
-    """由匹配结果解出相对平移方向 t（单位向量，尺度不可观测）。"""
+    """由匹配结果解出相对平移方向 t（单位向量，尺度不可观测）。
+
+    Qg / P2g 必须是**整场景归一化**的 2D 坐标（normalize_scene）。
+    """
     conf, bidx = W.max(dim=1)
     aidx = torch.arange(W.shape[0], device=W.device)
     sel = conf > max(0.3, 2.0 / max(W.shape[0], W.shape[1]))
-    if sel.sum() < 3:
+    if sel.sum().item() < 3:
         return np.zeros(3)
     pairs = torch.stack([aidx[sel], bidx[sel]], dim=1)
-    A = build_linear_system(to_cam_frame(Q), to_cam_frame(P2), pairs, R)
-    A = A.detach().cpu().numpy()
-    Np = pairs.shape[0]
-    _, _, Vt = np.linalg.svd(A)
-    z = Vt[-1]                       # 零空间向量 = [x_1..x_N, t]
-    t = z[Np:]
-    n = np.linalg.norm(t)
-    return t / n if n > 1e-9 else t
+    return solve_translation(Qg, P2g, pairs, R)
 
 
 def calibrate(P: np.ndarray, P2: np.ndarray, model: SteerPose, iters: int = 1000,
               lr: float = 0.01, lam: float = 1.0, alpha: float = 3.0,
               geom_start: float = 0.4, tau: float = 0.05, sinkhorn_iter: int = 50,
-              R_init: np.ndarray = None, seed: int = 0, verbose: bool = True) -> dict:
-    """两视角联合标定 + 匹配。P (B1,J,2) 与 P2 (B2,J,2) 为两视角的 2D 姿态集合。"""
+              R_init: np.ndarray = None, focal: float = None, seed: int = 0,
+              verbose: bool = True) -> dict:
+    """两视角联合标定 + 匹配。P (B1,J,2) 与 P2 (B2,J,2) 为两视角的 2D 姿态集合。
+
+    focal: 像素焦距。几何约束需要它把像素坐标换算成归一化图像坐标；
+           不传则按数据量级自动估计（见 losses.guess_focal）。已归一化的坐标传 1.0。
+    """
     torch.manual_seed(seed)
     device = next(model.parameters()).device
+    # 网络输入：逐姿态归一化（与训练一致，只看姿态形状）
     Pn = torch.from_numpy(np.stack([normalize_pose(p) for p in P])).float().to(device)
     P2n = torch.from_numpy(np.stack([normalize_pose(p) for p in P2])).float().to(device)
+    # 几何约束：按焦距归一化的图像坐标（保留位置与真实射线几何）；两视角共用同一 pp/f
+    pp = np.asarray(P, np.float64).reshape(-1, 2).mean(0)
+    f0 = guess_focal(P, focal)
+    Pg = torch.from_numpy(to_ray_coords(P, focal=f0, principal_point=pp)).float().to(device)
+    P2g = torch.from_numpy(to_ray_coords(P2, focal=f0, principal_point=pp)).float().to(device)
 
     if R_init is not None:
         rv0 = torch.tensor(matrix_to_rodrigues(R_init), device=device)
@@ -75,7 +83,7 @@ def calibrate(P: np.ndarray, P2: np.ndarray, model: SteerPose, iters: int = 1000
         R = rodrigues_to_matrix(rotvec)
         Q = model(Pn, rotvec)
         lm, W, S = matching_loss(Q, P2n, alpha=alpha, n_iter=sinkhorn_iter, tau=tau)
-        lg = geometric_loss(Q, P2n, W, R) if it >= int(iters * geom_start) \
+        lg = geometric_loss(Pg, P2g, W, R) if it >= int(iters * geom_start) \
             else torch.zeros((), device=device)
         loss = lm + lam * lg
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
@@ -88,12 +96,19 @@ def calibrate(P: np.ndarray, P2: np.ndarray, model: SteerPose, iters: int = 1000
         R = rodrigues_to_matrix(rotvec)
         Q = model(Pn, rotvec)
         _, W, S = matching_loss(Q, P2n, alpha=alpha, n_iter=sinkhorn_iter, tau=tau)
-        t = estimate_translation(Q, P2n, W, R)
+        t = estimate_translation(Pg, P2g, W, R)
+        # 匹配置信度：区分度不足时 Sinkhorn 会接近均匀指派，此时标定结果不可信
+        conf = W.max(dim=1).values
+        match_conf = float(conf.mean())
+        n_conf = int((conf > 0.3).sum())
     return {"R": R.detach().cpu().numpy(),
             "rotvec": rotvec.detach().cpu().numpy(),
             "t": t,
             "W": W.detach().cpu().numpy(),
             "matches": W.argmax(dim=1).detach().cpu().numpy(),
+            "match_conf": match_conf,
+            "n_confident": n_conf,
+            "n_targets": int(Pn.shape[0]),
             "curve": curve}
 
 
@@ -121,6 +136,9 @@ def parse_args():
     ap.add_argument("--lambda-geom", type=float, default=1.0)
     ap.add_argument("--alpha", type=float, default=3.0)
     ap.add_argument("--retries", type=int, default=5)
+    ap.add_argument("--focal", type=float, default=None,
+                    help="像素焦距（几何约束用）。不传则按数据量级自动估计；"
+                         "已归一化的坐标传 1.0")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--out", type=str, default=None, help="结果 npz 保存路径")
     return ap.parse_args()
@@ -135,29 +153,33 @@ def main():
     model.load_state_dict(ck["model"])
     print(f"[i] 载入权重 {args.ckpt}（{ck['num_joints']} 关节，epoch {ck.get('epoch', '?')}）")
 
-    gt = None
+    gt, t_gt = None, None
     if args.poses_npz:
         arr = np.load(args.poses_npz)
         P, P2 = arr["P"].astype(np.float64), arr["P2"].astype(np.float64)
         if "R" in arr:
             gt = arr["R"]
+        if "t" in arr:
+            t_gt = arr["t"]
     else:
         if not args.demo:
             print("[!] 未指定 --poses-npz，转到 --demo 自测模式")
-        poses3d = make_demo_dataset(num_anims=20, num_frames=1, seed=99)
-        vs = ViewSynthesizer(num_pairs=1, seed=7)
-        Ra, Rb, Rrel = vs.sample_pair()
-        poses_c = poses3d - poses3d.mean(axis=1, keepdims=True)
-        P = np.stack([normalize_pose(ortho_project(p, Ra)) for p in poses_c])
-        P2 = np.stack([normalize_pose(ortho_project(p, Rb)) for p in poses_c])
-        gt = Rrel
-        print(f"[i] 演示场景：{P.shape[0]} 个目标，真值相对旋转已知")
+        sc = make_two_view_scene(n_obj=12, seed=99)
+        P, P2, gt, t_gt = sc["P"], sc["P2"], sc["R"], sc["t"]
+        print(f"[i] 演示场景：{P.shape[0]} 个目标，真值相对旋转与平移均已知（透视投影）")
 
     print(f"[i] 输入：视角 A {P.shape}，视角 B {P2.shape}")
     res = calibrate_with_retries(P, P2, model, n_retries=args.retries,
                                  iters=args.iters, lam=args.lambda_geom,
-                                 alpha=args.alpha, verbose=True)
+                                 alpha=args.alpha, focal=args.focal, verbose=True)
     print(f"[i] 最优重启次数: {res['retry']}")
+    print(f"[i] 匹配置信度：平均 {res['match_conf']:.3f}，"
+          f"可信匹配 {res['n_confident']}/{res['n_targets']}")
+    if res["match_conf"] < 0.5 or res["n_confident"] < 3:
+        print("[!] 匹配置信度偏低 —— Sinkhorn 接近均匀指派，R 与 t 都不可信。\n"
+              "    常见原因：SteerPose 训练不足（quick 档位 30 epoch / 3000 pairs 只够跑通链路），\n"
+              "    或 2D 姿态噪声/掩码比例过高。请用 full 档位（≥400 epoch、≥20000 pairs）重训，\n"
+              "    或提高数据质量后重跑；先用 scripts/selftest_infer.py 确认实现本身没问题。")
     print(f"[result] R =\n{np.round(res['R'], 4)}")
     print(f"[result] t(单位方向) = {np.round(res['t'], 4)}")
     print(f"[result] 匹配: {res['matches'][:20]}{' ...' if len(res['matches']) > 20 else ''}")
@@ -167,6 +189,12 @@ def main():
         acc = float((res["matches"] == np.arange(len(res["matches"]))).mean()) \
             if len(res["matches"]) == len(P2) else float("nan")
         print(f"[result] 旋转误差 ER = {err:.2f}°   (匹配 argmax 与序号一致的比例 {acc:.2f})")
+    if t_gt is not None:
+        a = np.asarray(t_gt).ravel()
+        b = np.asarray(res["t"]).ravel()
+        if np.linalg.norm(a) > 1e-9 and np.linalg.norm(b) > 1e-9:
+            c = abs(float(np.dot(a, b)) / (np.linalg.norm(a) * np.linalg.norm(b)))
+            print(f"[result] 平移方向误差 Et = {np.degrees(np.arccos(np.clip(c, -1, 1))):.2f}°")
 
     if args.out:
         import os

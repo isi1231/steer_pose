@@ -36,6 +36,7 @@ steer_pose/
 │   ├── run_h100.sh       H100 推荐配置一键训练（quick / full / agnostic 三档）
 │   ├── sweep_h100.sh     小规模超参扫描（模型小，扫描比调参划算）
 │   ├── make_mock_mammal.py  生成"官方格式"的假数据，没下载数据集也能跑通全链路
+│   ├── selftest_infer.py   ⭐️ 推理链自检（匹配矩阵 + 几何一致性），秒级、不依赖训练
 │   ├── prepare_data.py   任意 3D 姿态 -> poses.npz（通用）
 │   ├── prepare_mammal.py BamaPig3D 3D 标注 -> poses.npz（支持 txt 目录与 pure_pickle）
 │   └── prepare_mammal_2d.py  BamaPig3D 2D 标注 + 真值外参 -> 两视角标定输入
@@ -195,15 +196,54 @@ bash scripts/sweep_h100.sh data/poses_bamapig_train.npz       # 超参扫描（�
 > 若要**复现论文的 class-agnostic 模型**：用 Animal3D（40 种四足）导出的 `poses.npz` 训练一次即可，
 > 之后可直接用于没见过的四足物种（论文 Table 1/4/6）。
 
+## 推理链自检（上服务器前先跑，5 秒）
+
+推断阶段（`calibrate`）的正确性几乎全在"匹配矩阵"和"几何一致性项"这两处，而**训练损失
+`Lkp` 不经过这两条路径**——所以 `Lkp` 下降完全不代表它们是对的。本仓库就曾因此藏过三个
+隐蔽 bug（见文末"实现修正记录"），因此把自检固化下来：
+
+```bash
+python scripts/selftest_infer.py              # 13 项检查，CPU 秒级
+python scripts/selftest_infer.py --reduce joints --noise 0.002
+```
+
+它构造一个已知真值 R、t 的合成两视角场景（透视投影），检查：
+
+| 组 | 检查内容 |
+|----|----------|
+| **M1 匹配** | `pose_distance` 形状为 `(B1,B2)` 且与朴素参考实现一致；`W` 形状/行列归一化；加大 `n_iter` 行和误差下降；同视角自匹配对角线命中率 = 1.0 |
+| **M2 几何** | `Lgeom(R_gt)` 显著小于 `Lgeom(R_wrong)`（实测对比度 ~700×）；用 R_gt 解出的 t 方向误差 < 5°；错误 R 下 t 误差明显更大；梯度无 NaN；真值附近起步不发散 |
+
+**任何改动 `losses.py` / `calibrate.py` 后都应重跑这个自检。**
+
 ## 标定（推理时联合优化）
 
 ```bash
 # 自测：程序化场景 + 真值对比（输出旋转误差 ER）
 python -m steerpose.calibrate --ckpt ckpt/demo_best.pt --demo
 
-# 真实两视角：npz 内含 'P' (B1,J,2)、'P2' (B2,J,2)，可选 'R' 作为真值
+# 真实两视角：npz 内含 'P' (B1,J,2)、'P2' (B2,J,2)，可选 'R'/'t' 作为真值
 python -m steerpose.calibrate --ckpt ckpt/steerpose_quad.pt \
     --poses-npz data/two_view_poses.npz --out out/two_view.npz
+```
+
+⚠️ **焦距（`--focal`）**：几何一致性项把 2D 坐标当作**归一化图像坐标** `(u, v)`，
+视线方向是 `(u, v, 1)`。所以坐标必须是"按焦距归一化"的，不能用按包围盒缩放的坐标——
+缩放会改变每条射线的方向，正确的 R 就不再对应零奇异值。
+
+- 输入是**像素坐标**时：传 `--focal <像素焦距>`（不知道就估计 `f ≈ 0.9 × 图像长边`）；
+- 不传则按数据量级自动估（像素量级自动用 `0.9×尺寸`，已归一化的坐标直接用 `1.0`）；
+- 主点默认取所有点的均值（无内参时的代理），有标定内参时请在代码里显式传 `principal_point`。
+
+**如何准备两视角 2D 姿态**：用现成 2D 姿态估计器（DeepLabCut / RTMPose / animal-ap10 等）
+分别在两个视角上检测同一时刻的 2D 姿态，按同一骨架顺序堆成 `(B, J, 2)` 数组。
+两个视角数量不同（遮挡导致漏检）也可以——论文用 dummy 目标处理。
+
+复现的默认超参（论文附录 D.3）：Adam lr=0.01，1000 次迭代，lr 线性衰减 1.0→0.01，
+`Lgeom` 在 40% 迭代后激活，α=3，失败最多 5 次随机重启。
+
+标定结束会打印**匹配置信度**诊断。若平均置信度 < 0.5，说明 Sinkhorn 接近均匀指派、
+R 与 t 都不可信（通常是 SteerPose 训练不足），脚本会给出明确提示。
 ```
 
 也支持代码内调用：
@@ -224,9 +264,25 @@ res["W"]         # Sinkhorn 软指派矩阵
 复现的默认超参（论文附录 D.3）：Adam lr=0.01，1000 次迭代，lr 线性衰减 1.0→0.01，
 `Lgeom` 在 40% 迭代后激活，α=3，失败最多 5 次随机重启。
 
+## 实现修正记录（2026-09-16）
+
+训练曲线看不出这三个问题，因为**训练损失 `Lkp` 完全不经过匹配与几何这两条路径**。
+发现方式是为 `calibrate` 写了几何自检（现为 `scripts/selftest_infer.py`）。
+
+| # | 位置 | 问题 | 后果 | 修正 |
+|---|------|------|------|------|
+| 1 | `losses.pose_distance` | 用 `torch.cdist(q, p).mean(-1)` 处理 `(B,J,2)`。cdist 把 `(B,J,2)` 当**批量矩阵**沿 J 维广播，返回 `(B,J)` 而非 `(B1,B2)` | 匹配矩阵维度与语义**全错**（Sinkhorn 归一化作用错维度），几何项随后越界崩溃；而 `Lkp` 下降看起来完全正常 | 改为广播作差 + 逐关节求范数：`(q[:,None]-p[None]).norm(-1).mean(-1)` → `(B1,B2)`；并加 `pose_distance_ref` 朴素参考实现做交叉验证 |
+| 2 | `losses.geometric_loss` | 返回 `σ_2ndmin/σ_min`（论文要求 `σ_min/σ_2ndmin`，且 `torch.linalg.svdvals` 返回**降序**） | 损失方向反了，会把 R 往**远离**真值的方向推 | 改为 `s[-1]/(s[-2]+ε)`，并加"仅用 Lgeom 优化应能收敛"的验证 |
+| 3 | `losses.build_linear_system` | 行的列宽 `torch.zeros(3, 3+3)` 与 `torch.cat(rows, dim=1)` 自相矛盾，且 `Q[a]` 是整姿态 `(J,2)` 而非单点 | Lgeom 一旦真正激活（匹配置信度 > 0.3）就抛 `RuntimeError`；训练早期置信度低、Lgeom 恒为 0，**问题被掩盖** | 重写为 `A (3N, N+3)`：每个匹配姿态对取质心作一个 3D 点（论文 "N corresponding 2D pose pairs" 口径），未知量为深度 `x_i` 与 `t`；`torch.cat(..., dim=0)` |
+
+同时修正的建模问题：几何约束原先用"按包围盒缩放"的归一化坐标，缩放会改变射线方向，
+正确的 R 不再对应零奇异值 —— 现改用按**焦距**归一化的图像坐标（见上文 `--focal` 说明）。
+
 ## 已验证 / 未实现
 
 - ✅ 已验证：训练与标定全流程可在小规模数据上端到端跑通（含真值误差评估）；
+- ✅ 已验证：推理链（匹配矩阵 + 几何一致性 + 平移求解）由 `scripts/selftest_infer.py`
+  以合成真值场景逐项验证（13 项检查全通过，`Lgeom` 真值/随机对比度 ~700×，t 方向误差 0.02°）；
 - ⬜ 未实现：多视角整合（motion averaging + 循环一致匹配 + bundle adjustment，论文第 4 节）——
   可参考同作者前作 [RA-L 2022 代码](https://github.com/kyotovision-public/extrinsic-camera-calibration-from-a-moving-person)（MIT），
   其中的共线/共面约束、chirality check 与 BA 是 SteerPose 几何部分的技术来源；
@@ -240,11 +296,15 @@ res["W"]         # Sinkhorn 软指派矩阵
 注意演示数据规模小，损失不会降到论文水平（论文 Table 4 的关节误差在 0.1~0.2 量级）。
 
 **Q: 标定结果很差 / Sinkhorn 匹配置信度几乎均匀，是不是代码有 bug？**
-先检查 SteerPose 是否训练充分。标定质量完全取决于模型的区分度：如果模型对"同一姿态在不同
-视角下的样子"预测不准，那么正确配对的姿态距离会和错误配对差不多，Sinkhorn 输出接近均匀分布、
-`Lgeom` 也会因为筛不出足够可靠匹配（置信度低于阈值）而恒为 0。经验门槛：演示数据上
-val Lkp 至少降到 0.35 以下，标定才开始给出有意义的旋转估计。建议先跑：
+**先跑 `python scripts/selftest_infer.py`** —— 它 5 秒内就能告诉你实现本身有没有问题
+（不依赖训练、不依赖数据）。如果自检全通过，那就是模型区分度不够：标定质量完全取决于
+SteerPose 能否准确预测"同一姿态在另一视角下的样子"。正确配对的姿态距离一旦和错误配对
+差不多，Sinkhorn 就会输出接近均匀的指派、`Lgeom` 也会因为筛不出可靠匹配而恒为 0。
+经验门槛：演示数据上 val Lkp 至少降到 0.35 以下，标定才开始给出有意义的旋转估计。
+`quick` 档位（30 epoch / 3000 pairs）**只够验证链路，不足以产出可用标定结果**，请用 `full` 档位。
+
 ```bash
+python scripts/selftest_infer.py                     # 先确认实现没问题
 python -m steerpose.train --demo --epochs 200 --num-pairs 4000 --out ckpt/demo.pt
 python -m steerpose.calibrate --ckpt ckpt/demo_best.pt --demo --iters 1000
 ```

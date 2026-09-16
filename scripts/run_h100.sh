@@ -45,6 +45,22 @@ echo
 echo "查看进度:   tail -f log/train_${NAME}_${TAG}.out"
 echo "结构化日志: tail -f ckpt/${NAME}_${TAG}_train.log"
 echo
-echo "训练结束后标定（示例：相机 0 <-> 6）："
-echo "  python -m steerpose.calibrate --ckpt ckpt/${NAME}_${TAG}_best.pt \\"
-echo "      --poses-npz data/two_view_pig_c0_c6.npz --out out/two_view_c0_c6.npz"
+if [ "$MODE" = "quick" ]; then
+  echo "!! quick 档位只用于验证链路能否跑通，模型区分度不足，标定结果不可用。"
+  echo "   正式训练请跑: bash scripts/run_h100.sh $POSES"
+  echo
+fi
+echo "标定前请先确认推断链实现无误（5 秒）:"
+echo "  python scripts/selftest_infer.py"
+echo
+echo "完整标定流程（两视角，相机 0 <-> 6）:"
+echo "  1) 造数据（用官方 2D 标注 + 真值外参，可顺便算论文的 ER/Et）"
+echo "     python scripts/prepare_mammal_2d.py \\"
+echo "         --kp2d /data/BamaPig3D_pure_pickle/label_keypoints2d.pkl \\"
+echo "         --extrinsics /data/BamaPig3D/extrinsic_camera_params \\"
+echo "         --cam-a 0 --cam-b 6 --min-frame 1400 \\"
+echo "         --out data/two_view_pig_c0_c6.npz"
+echo "  2) 标定（--focal 传像素焦距，估计值可用 0.9 x 图像长边）"
+echo "     python -m steerpose.calibrate --ckpt ckpt/${NAME}_${TAG}_best.pt \\"
+echo "         --poses-npz data/two_view_pig_c0_c6.npz --out out/two_view_c0_c6.npz"
+echo "  3) 看输出里的 ER / Et / 匹配置信度（置信度 < 0.5 则结果不可信）"
